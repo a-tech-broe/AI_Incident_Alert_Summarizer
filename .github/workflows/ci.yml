@@ -34,10 +34,12 @@ jobs:
         run: terraform fmt -check -recursive -diff
         working-directory: terraform
 
-      # No backend: validation only needs the provider schemas, and this keeps
-      # the job credential-free.
+      # -backend=false is required, not cosmetic: backend.tf names a real S3
+      # bucket, and without the flag init would try to reach it. This job holds
+      # no AWS credentials by design, so that call fails — and validation only
+      # needs the provider schemas anyway.
       - name: terraform init (no backend)
-        run: terraform init -input=false
+        run: terraform init -backend=false -input=false
         working-directory: terraform
 
       - name: terraform validate
@@ -49,7 +51,7 @@ jobs:
           set -euo pipefail
           for module in terraform/modules/*/; do
             echo "::group::validate ${module}"
-            terraform -chdir="${module}" init -input=false
+            terraform -chdir="${module}" init -backend=false -input=false
             terraform -chdir="${module}" validate
             echo "::endgroup::"
           done
@@ -87,8 +89,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to a commit SHA, not @master: a tag can be moved and a branch
+      # changes under us, either of which alters what runs in this pipeline with
+      # no commit on our side. SHA is the only immutable reference GitHub offers.
+      # Bump deliberately; the trailing comment records which tag it maps to.
       - name: Run Checkov
-        uses: bridgecrewio/checkov-action@master
+        uses: bridgecrewio/checkov-action@9b70310bcd306d11740313070b940167d6b23085 # v12.3115.0
         with:
           directory: terraform
           framework: terraform
