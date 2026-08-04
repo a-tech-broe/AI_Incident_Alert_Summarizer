@@ -1,0 +1,134 @@
+name: CI
+
+# Everything here runs without AWS credentials, so it works on forks and gives
+# fast feedback before the plan job spends an OIDC session.
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.9.8"
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  terraform-lint:
+    name: Terraform fmt and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: terraform
+
+      # No backend: validation only needs the provider schemas, and this keeps
+      # the job credential-free.
+      - name: terraform init (no backend)
+        run: terraform init -backend=false -input=false
+        working-directory: terraform
+
+      - name: terraform validate
+        run: terraform validate -no-color
+        working-directory: terraform
+
+      - name: Validate each module in isolation
+        run: |
+          set -euo pipefail
+          for module in terraform/modules/*/; do
+            echo "::group::validate ${module}"
+            terraform -chdir="${module}" init -backend=false -input=false
+            terraform -chdir="${module}" validate -no-color
+            echo "::endgroup::"
+          done
+
+  tflint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      # --recursive resolves a relative --config against each directory it
+      # visits, so the config is pinned by absolute path instead.
+      - name: TFLint
+        working-directory: terraform
+        env:
+          TFLINT_CONFIG_FILE: ${{ github.workspace }}/terraform/.tflint.hcl
+        run: |
+          tflint --init
+          tflint --recursive --format compact
+
+  security-scan:
+    name: Checkov
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform
+          framework: terraform
+          quiet: true
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          # Findings are advisory on this repo; flip to false once the baseline
+          # is clean so regressions actually block a merge.
+          soft_fail: true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('checkov.sarif') != ''
+        with:
+          sarif_file: checkov.sarif
+
+  python:
+    name: Lambda lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r lambda/requirements.txt
+          pip install -r lambda/requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check lambda
+
+      - name: Ruff format check
+        run: ruff format --check lambda
+
+      - name: mypy
+        run: mypy lambda --ignore-missing-imports
+        continue-on-error: true
+
+      - name: pytest
+        run: pytest lambda/tests -v --tb=short
+        env:
+          AWS_DEFAULT_REGION: us-east-1

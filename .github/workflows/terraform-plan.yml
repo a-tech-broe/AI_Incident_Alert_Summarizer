@@ -1,0 +1,137 @@
+name: Terraform Plan
+
+# Runs against real AWS state so the diff is trustworthy, but holds no write
+# permissions of its own — the apply path lives in deploy.yml behind an
+# environment approval.
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-plan.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required to mint the OIDC token
+  pull-requests: write # required to post the plan comment
+
+concurrency:
+  group: tf-plan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.9.8"
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    environment: plan
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-plan-${{ github.run_id }}
+
+      - name: terraform fmt
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}"
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -var="github_repository=${{ github.repository }}" \
+            -out=tfplan | tee plan.txt
+          terraform show -no-color tfplan > plan-full.txt
+
+      # The binary plan is what apply consumes; retaining it means the approved
+      # diff is exactly what gets applied, with no re-plan race in between.
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: |
+            terraform/tfplan
+            terraform/plan-full.txt
+          retention-days: 5
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const raw = fs.readFileSync('terraform/plan-full.txt', 'utf8');
+
+            // GitHub rejects comments over 65536 characters; keep the tail,
+            // which holds the resource changes and the summary line.
+            const LIMIT = 60000;
+            const plan = raw.length > LIMIT
+              ? `_(truncated — see the workflow artifact for the full plan)_\n\n...${raw.slice(-LIMIT)}`
+              : raw;
+
+            const body = [
+              '### Terraform Plan',
+              '',
+              `Format check: \`${{ steps.fmt.outcome }}\` · Plan: \`${{ steps.plan.outcome }}\``,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            // Update in place so a busy PR does not accumulate stale plans.
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith('### Terraform Plan'));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
