@@ -223,6 +223,18 @@ variable "github_environments" {
   default     = ["plan", "production"]
 }
 
+variable "state_bucket" {
+  description = "S3 bucket holding Terraform state. Must match the literal in backend.tf; used to grant the deployment role state access."
+  type        = string
+  default     = "bokiti123"
+}
+
+variable "state_lock_table" {
+  description = "DynamoDB table used for state locking. Must match the literal in backend.tf; used to grant the deployment role lock access."
+  type        = string
+  default     = "family_dyning"
+}
+
 variable "create_github_oidc_provider" {
   description = "Create the GitHub OIDC provider. Set false when the account already has one, since it is an account-wide singleton."
   type        = bool

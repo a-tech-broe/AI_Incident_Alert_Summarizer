@@ -2,6 +2,18 @@ locals {
   name_prefix   = "${var.project_name}-${var.environment}"
   function_name = "${var.project_name}-${var.environment}-summarizer"
 
+  # Derived from the same names hardcoded in backend.tf. Terraform cannot read
+  # its own backend configuration, so the values are mirrored through variables.
+  state_bucket_arn = "arn:${data.aws_partition.current.partition}:s3:::${var.state_bucket}"
+
+  state_lock_table_arn = format(
+    "arn:%s:dynamodb:%s:%s:table/%s",
+    data.aws_partition.current.partition,
+    var.aws_region,
+    data.aws_caller_identity.current.account_id,
+    var.state_lock_table,
+  )
+
   common_tags = merge(
     {
       Project     = var.project_name
@@ -218,6 +230,11 @@ module "github_oidc" {
 
   artifacts_bucket_arn = module.artifacts.bucket_arn
   lambda_function_arn  = module.lambda.function_arn
+
+  # Without these the pipeline can assume the role but not read or lock state,
+  # so every CI run fails at `terraform init`.
+  state_bucket_arn     = local.state_bucket_arn
+  state_lock_table_arn = local.state_lock_table_arn
 
   tags = local.common_tags
 }

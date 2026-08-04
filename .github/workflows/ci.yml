@@ -37,11 +37,11 @@ jobs:
       # No backend: validation only needs the provider schemas, and this keeps
       # the job credential-free.
       - name: terraform init (no backend)
-        run: terraform init -backend=false -input=false
+        run: terraform init -input=false
         working-directory: terraform
 
       - name: terraform validate
-        run: terraform validate -no-color
+        run: terraform validate
         working-directory: terraform
 
       - name: Validate each module in isolation
@@ -49,8 +49,8 @@ jobs:
           set -euo pipefail
           for module in terraform/modules/*/; do
             echo "::group::validate ${module}"
-            terraform -chdir="${module}" init -backend=false -input=false
-            terraform -chdir="${module}" validate -no-color
+            terraform -chdir="${module}" init -input=false
+            terraform -chdir="${module}" validate
             echo "::endgroup::"
           done
 
@@ -135,4 +135,4 @@ jobs:
       - name: pytest
         run: pytest lambda/tests -v --tb=short
         env:
-          AWS_DEFAULT_REGION: us-east-1
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}

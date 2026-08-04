@@ -68,11 +68,7 @@ jobs:
 
       - name: terraform init
         run: |
-          terraform init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
-            -backend-config="region=${{ vars.AWS_REGION }}" \
-            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}"
+          terraform init -input=false
 
       - name: terraform validate
         run: terraform validate -no-color
@@ -152,11 +148,7 @@ jobs:
 
       - name: terraform init
         run: |
-          terraform init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
-            -backend-config="region=${{ vars.AWS_REGION }}" \
-            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}"
+          terraform init -input=false
 
       - name: terraform apply
         run: terraform apply -input=false -no-color -lock-timeout=5m -auto-approve tfplan
@@ -205,11 +197,7 @@ jobs:
           # Read from Terraform outputs rather than hard-coding names, so a
           # rename in Terraform cannot silently deploy to a stale function.
           cd terraform
-          terraform init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
-            -backend-config="region=${{ vars.AWS_REGION }}" \
-            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" >/dev/null
+          terraform init -input=false >/dev/null
 
           {
             echo "function_name=$(terraform output -raw lambda_function_name)"

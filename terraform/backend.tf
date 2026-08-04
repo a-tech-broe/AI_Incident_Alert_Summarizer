@@ -1,17 +1,20 @@
-# Partial backend configuration.
+# Remote state in an existing bucket and lock table.
 #
-# Values are supplied at init time so the same code can target multiple
-# environments without editing tracked files:
+# Backend blocks cannot reference variables, so these are literals. The same
+# names are mirrored into var.state_bucket / var.state_lock_table so the OIDC
+# deployment role can be granted access to them — keep the two in sync.
 #
-#   terraform init \
-#     -backend-config="bucket=my-tfstate-bucket" \
-#     -backend-config="key=ai-incident-summarizer/dev/terraform.tfstate" \
-#     -backend-config="region=us-east-1" \
-#     -backend-config="dynamodb_table=my-tfstate-locks"
+# To target a different environment, override just the key at init time; a
+# fully-specified backend still accepts partial overrides:
 #
-# CI passes these from repository variables (see .github/workflows/).
+#   terraform init -reconfigure \
+#     -backend-config="key=ai-incident-summarizer/prod/terraform.tfstate"
 terraform {
   backend "s3" {
-    encrypt = true
+    bucket         = "bokiti123"
+    key            = "ai-incident-summarizer/dev/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "family_dyning"
+    encrypt        = true
   }
 }

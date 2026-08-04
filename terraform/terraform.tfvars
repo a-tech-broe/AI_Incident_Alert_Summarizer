@@ -47,6 +47,12 @@ splunk_index             = "main"
 context_lookback_minutes = 30
 slack_channel            = "#incidents"
 
+# --- Remote state ---------------------------------------------------------
+# These must match the literals in backend.tf. They exist only so the OIDC
+# deployment role can be granted access to the state bucket and lock table.
+state_bucket     = "bokiti123"
+state_lock_table = "family_dyning"
+
 # --- CI/CD ----------------------------------------------------------------
 # Set to your repository to create the OIDC deployment role, then publish the
 # resulting github_actions_role_arn output as the AWS_ROLE_ARN repo variable.

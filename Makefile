@@ -4,12 +4,10 @@ TF_DIR      := terraform
 LAMBDA_DIR  := lambda
 PYTHON      ?= python3
 
-# Backend settings are supplied at init time. Export these, or pass them on the
-# command line: make tf-init TF_STATE_BUCKET=... TF_STATE_KEY=...
-TF_STATE_BUCKET     ?=
-TF_STATE_KEY        ?= ai-incident-summarizer/dev/terraform.tfstate
-TF_STATE_LOCK_TABLE ?=
-AWS_REGION          ?= us-east-1
+# The backend bucket, key and lock table are fixed in terraform/backend.tf.
+# Override TF_STATE_KEY to point at a different environment's state.
+TF_STATE_KEY ?=
+AWS_REGION   ?= us-east-1
 
 .PHONY: help
 help: ## Show this help
@@ -21,13 +19,9 @@ help: ## Show this help
 # ---------------------------------------------------------------------------
 
 .PHONY: tf-init
-tf-init: ## Initialize Terraform against the remote backend
-	@test -n "$(TF_STATE_BUCKET)" || { echo "TF_STATE_BUCKET is required"; exit 1; }
+tf-init: ## Initialize Terraform against the remote backend (s3://bokiti123)
 	terraform -chdir=$(TF_DIR) init -input=false \
-		-backend-config="bucket=$(TF_STATE_BUCKET)" \
-		-backend-config="key=$(TF_STATE_KEY)" \
-		-backend-config="region=$(AWS_REGION)" \
-		-backend-config="dynamodb_table=$(TF_STATE_LOCK_TABLE)"
+		$(if $(TF_STATE_KEY),-reconfigure -backend-config="key=$(TF_STATE_KEY)")
 
 .PHONY: tf-init-local
 tf-init-local: ## Initialize without a backend (validation only)

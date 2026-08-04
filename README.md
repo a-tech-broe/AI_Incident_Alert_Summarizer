@@ -125,7 +125,8 @@ dependency cycle (`iam → eventbridge → lambda → iam`).
 ### Prerequisites
 
 - Terraform ≥ 1.6, Python 3.13, AWS CLI
-- An S3 bucket and DynamoDB table for Terraform state
+- Remote state is already configured in `terraform/backend.tf` — bucket
+  `bokiti123`, lock table `family_dyning`, both in `us-east-1`
 - **Bedrock model access requested** for your account and region — the first
   apply succeeds without it, but every invocation will fail with
   `AccessDeniedException` until it is granted
@@ -133,7 +134,7 @@ dependency cycle (`iam → eventbridge → lambda → iam`).
 ### 1. Configure and apply
 
 ```bash
-make tf-init TF_STATE_BUCKET=my-tfstate TF_STATE_LOCK_TABLE=my-tf-locks
+make tf-init
 terraform -chdir=terraform plan
 terraform -chdir=terraform apply
 ```
@@ -190,7 +191,9 @@ Set `github_repository` in tfvars, re-apply, then configure the repository:
 | --- | --- |
 | `AWS_ROLE_ARN` | the `github_actions_role_arn` output |
 | `AWS_REGION` | your region |
-| `TF_STATE_BUCKET` / `TF_STATE_KEY` / `TF_STATE_LOCK_TABLE` | backend settings |
+
+Backend settings are no longer repository variables — they are literals in
+`terraform/backend.tf`.
 
 Create two GitHub environments: `plan` (no reviewers) and `production` (required
 reviewers). The `production` environment is what makes the apply step pause for
