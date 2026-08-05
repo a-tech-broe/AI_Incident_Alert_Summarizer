@@ -105,11 +105,58 @@ jobs:
           # is clean so regressions actually block a merge.
           soft_fail: true
 
-      - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@v4
+      # Always keep the SARIF, regardless of where it can be published. On a
+      # private repo without Advanced Security this artifact is the only way to
+      # get the findings off the runner.
+      - name: Upload SARIF as an artifact
+        uses: actions/upload-artifact@v4
         if: always() && hashFiles('checkov.sarif') != ''
         with:
+          name: checkov-sarif-${{ github.run_id }}
+          path: checkov.sarif
+          retention-days: 30
+
+      # Publishing to the Security tab needs code scanning, which on a PRIVATE
+      # repo requires GitHub Advanced Security. Without it the upload fails with
+      # "Advanced Security must be enabled for this repository" — after the scan
+      # has already succeeded, so the job goes red for a reason unrelated to the
+      # code. Gated on an opt-in variable rather than left to fail.
+      #
+      # To turn on: make the repo public (code scanning is free there), or enable
+      # Advanced Security, then set repository variable ENABLE_CODE_SCANNING=true.
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && vars.ENABLE_CODE_SCANNING == 'true' && hashFiles('checkov.sarif') != ''
+        with:
           sarif_file: checkov.sarif
+
+      - name: Summarize findings
+        if: always() && hashFiles('checkov.sarif') != ''
+        run: |
+          set -euo pipefail
+          total=$(jq '[.runs[].results[]] | length' checkov.sarif)
+          {
+            echo "## Checkov"
+            echo ""
+            echo "**${total}** finding(s). Full SARIF is attached as a workflow artifact."
+            if [ "${total}" -gt 0 ]; then
+              echo ""
+              echo "| Rule | Level | Location |"
+              echo "| --- | --- | --- |"
+              jq -r '
+                [.runs[].results[]][:25][]
+                | "| \(.ruleId // "?") | \(.level // "warning") | \(
+                    .locations[0].physicalLocation.artifactLocation.uri // "?"
+                  ):\(
+                    .locations[0].physicalLocation.region.startLine // 0
+                  ) |"
+              ' checkov.sarif
+              if [ "${total}" -gt 25 ]; then
+                echo ""
+                echo "_Showing 25 of ${total}; see the artifact for the rest._"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   python:
     name: Lambda lint and tests
