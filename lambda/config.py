@@ -205,6 +205,11 @@ def get_secret(secret_id: str) -> str:
     else:
         value = parsed.get("value", raw) if isinstance(parsed, dict) else raw
 
+    # Secrets are pasted by hand, and a stray leading or trailing space survives
+    # JSON encoding invisibly. urllib3 then rejects the URL for containing a
+    # control character, which reads like a network fault rather than a typo.
+    value = value.strip() if isinstance(value, str) else value
+
     if not value or value == _PLACEHOLDER:
         raise SecretNotConfigured(
             f"Secret '{secret_id}' still holds the Terraform placeholder. "
