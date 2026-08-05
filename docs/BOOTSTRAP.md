@@ -87,6 +87,49 @@ terraform -chdir=terraform plan     # review before applying
 terraform -chdir=terraform apply
 ```
 
+### Lambda concurrency on a new account
+
+A fresh AWS account has a **total** Lambda concurrency quota of 10, and AWS
+enforces a floor of 10 *unreserved* executions. Any reservation therefore fails:
+
+```text
+InvalidParameterValueException: Specified ReservedConcurrentExecutions for
+function decreases account's UnreservedConcurrentExecution below its minimum
+value of [10].
+```
+
+`lambda_reserved_concurrency = -1` is set for this reason. Nothing is lost while
+the quota is 10 — the account limit already caps concurrent Bedrock calls harder
+than the reservation would have. Once the quota is raised (**Service Quotas →
+Lambda → Concurrent executions**), set it back to `10`, or a flapping alert rule
+can fan out across the new headroom.
+
+Check the current value with:
+
+```bash
+aws lambda get-account-settings \
+  --query 'AccountLimit.[ConcurrentExecutions,UnreservedConcurrentExecutions]'
+```
+
+### If an apply fails partway
+
+Terraform taints a resource whose creation succeeded but whose follow-up call
+failed — the concurrency error above leaves `aws_lambda_function.this` tainted,
+and the next plan shows it as `delete/create` rather than an update. If the
+function is otherwise healthy, clear the mark instead of letting it churn:
+
+```bash
+aws lambda get-function-configuration \
+  --function-name ai-incident-summarizer-dev-summarizer \
+  --query '[State,LastUpdateStatus]'          # expect Active / Successful
+
+terraform -chdir=terraform untaint module.lambda.aws_lambda_function.this
+```
+
+A tainted resource shows up in `terraform show -json` with `"tainted": true`, and
+in the plan with `replace_paths: null` and every `after` value nulled — that
+combination distinguishes a taint from a genuine config-driven replacement.
+
 ## Step 4 — Populate the secrets
 
 Terraform creates the containers with a `REPLACE_ME` placeholder, and the Lambda

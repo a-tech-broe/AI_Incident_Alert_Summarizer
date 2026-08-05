@@ -8,10 +8,20 @@ environment  = "dev"
 aws_region   = "us-east-1"
 
 # --- Lambda ---------------------------------------------------------------
-lambda_runtime              = "python3.13"
-lambda_memory_size          = 512
-lambda_timeout              = 60
-lambda_reserved_concurrency = 10
+lambda_runtime     = "python3.13"
+lambda_memory_size = 512
+lambda_timeout     = 60
+# -1 = no reservation.
+#
+# This account's total concurrency quota is 10 (the new-account default) and AWS
+# enforces a floor of 10 *unreserved* executions, so any reservation is rejected
+# with InvalidParameterValueException — even a reservation of 1.
+#
+# Nothing is lost while the quota stays at 10: the account limit already caps
+# concurrent Bedrock calls harder than the reservation would have. Once the quota
+# is raised (Service Quotas > Lambda > Concurrent executions), set this back to
+# 10 or so — otherwise a flapping alert rule can fan out across the new headroom.
+lambda_reserved_concurrency = -1
 lambda_log_level            = "INFO"
 
 # Grafana's webhook contact point posts here. Disable if alerts arrive only via
