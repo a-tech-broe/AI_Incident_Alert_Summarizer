@@ -178,17 +178,36 @@ aws secretsmanager put-secret-value \
   --secret-string '{"value":"https://hooks.slack.com/services/NEW"}'
 ```
 
-Secrets are cached for the life of the execution container, so a rotation is
-picked up within minutes as containers recycle. To force it immediately, publish
-a no-op configuration change:
-
-```bash
-aws lambda update-function-configuration --function-name "$FUNC" \
-  --description "rotate $(date -u +%FT%TZ)"
-```
+Values are stripped of surrounding whitespace on read — a pasted leading space
+would otherwise produce a confusing `InvalidURL` / "control characters" failure
+rather than an obvious typo.
 
 Terraform ignores changes to secret values, so a later `apply` will not revert
 them.
+
+### Forcing the new value to take effect
+
+`get_secret` is cached for the life of the execution container, so a warm
+container keeps serving the old value. Containers recycle on their own after
+roughly 5–15 minutes idle; if you can wait, do nothing.
+
+To force it, toggle reserved concurrency down and back:
+
+```bash
+aws lambda put-function-concurrency --function-name "$FUNC" \
+  --reserved-concurrent-executions 0            # drains all containers
+aws lambda delete-function-concurrency --function-name "$FUNC"   # back to unreserved
+```
+
+This ends in exactly the state Terraform expects (`lambda_reserved_concurrency
+= -1`), so it leaves no drift. Invocations are rejected for the few seconds
+between the two commands.
+
+**Do not use `update-function-configuration --description` for this.** It works,
+but `description` is Terraform-managed, so the change shows up as a pending
+update on every later plan until an apply reverts it. Any Terraform-managed
+attribute has the same problem — reserved concurrency is the exception only
+because deleting the override restores the managed value.
 
 ---
 

@@ -29,9 +29,16 @@ resource "aws_s3_object" "bootstrap" {
   source = data.archive_file.bootstrap.output_path
   etag   = data.archive_file.bootstrap.output_md5
 
-  # The deploy workflow overwrites this key. Terraform must not drag it back.
+  # This is a one-time seed, not a managed artifact. Once the deploy workflow
+  # uploads real code to this key, Terraform must never touch the object again.
+  #
+  # `ignore_changes = all` rather than a field list: the deploy workflow's
+  # `aws s3 cp` replaces the object wholesale, which drops the provider-applied
+  # tags and metadata. Those are not in a field list, so Terraform planned a
+  # modify — and modifying an S3 object means re-uploading it from `source`,
+  # which only exists on the runner that ran `plan`.
   lifecycle {
-    ignore_changes = [etag, source, source_hash]
+    ignore_changes = all
   }
 }
 
