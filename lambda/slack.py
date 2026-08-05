@@ -36,6 +36,28 @@ _CONFIDENCE_NOTE = {
 _MAX_LIST_ITEMS = 6
 _MAX_TEXT = 2800
 
+# Maps the failure to something a responder can act on. Ordered — first match
+# wins, so put the more specific patterns first.
+_FAILURE_REASONS: tuple[tuple[str, str], ...] = (
+    ("Too many tokens", "Bedrock daily token quota is exhausted. It resets on a rolling 24h basis."),
+    ("ThrottlingException", "Bedrock is throttling requests. Retry shortly."),
+    ("AccessDeniedException", "Bedrock model access is not granted for this account and region."),
+    ("ValidationException", "Bedrock rejected the request — check the configured model ID."),
+    ("ModelTimeoutException", "Bedrock timed out generating the summary."),
+    ("ReadTimeoutError", "Bedrock timed out generating the summary."),
+    ("ServiceUnavailable", "Bedrock is temporarily unavailable."),
+    ("still holds the Terraform placeholder", "A required credential has not been configured."),
+    ("no JSON object", "The model returned output the parser could not read."),
+)
+
+
+def _explain_failure(error: str) -> str:
+    """Turn an exception string into one actionable sentence."""
+    for needle, reason in _FAILURE_REASONS:
+        if needle in error:
+            return reason
+    return "Summarization failed. See CloudWatch Logs for the full error."
+
 
 def post_summary(alert: dict[str, Any], summary: dict[str, Any], context: dict[str, Any]) -> bool:
     """Post a summarized incident to Slack. Returns delivery success."""
@@ -50,32 +72,43 @@ def post_fallback(alert: dict[str, Any], error: str) -> bool:
     The pipeline degrading must never mean silence: an unsummarized page is far
     better than a page that never arrives.
     """
-    blocks = [
+    blocks: list[dict[str, Any]] = [
         {
             "type": "header",
             "text": {"type": "plain_text", "text": f"⚠️ {_truncate(alert.get('name', 'Alert'), 140)}"},
         },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (f"*AI summarization unavailable — raw alert follows.*\n`{_truncate(error, 300)}`"),
-            },
-        },
+    ]
+
+    # The alert's own text is what the responder needs first — it is the only
+    # description of the problem when there is no summary. Put it directly under
+    # the headline, above the machinery.
+    description = alert.get("summary") or alert.get("description")
+    if description:
+        blocks.append(
+            {"type": "section", "text": {"type": "mrkdwn", "text": _truncate(description, _MAX_TEXT)}}
+        )
+
+    blocks.append(
         {
             "type": "section",
             "fields": [
                 {"type": "mrkdwn", "text": f"*Severity*\n{alert.get('severity', 'unknown')}"},
                 {"type": "mrkdwn", "text": f"*Service*\n{alert.get('service') or 'unknown'}"},
             ],
-        },
-    ]
+        }
+    )
 
-    description = alert.get("summary") or alert.get("description")
-    if description:
-        blocks.append(
-            {"type": "section", "text": {"type": "mrkdwn", "text": _truncate(description, _MAX_TEXT)}}
-        )
+    # Why summarization failed, in a sentence — not the raw exception.
+    #
+    # A boto traceback tells an on-call engineer nothing actionable, buries the
+    # alert it is attached to, and is an uncontrolled string being posted into a
+    # chat channel. The full error is in CloudWatch Logs, where it belongs.
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"_No AI summary: {_explain_failure(error)}_"}],
+        }
+    )
 
     links = _link_block(alert)
     if links:

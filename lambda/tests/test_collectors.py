@@ -250,3 +250,60 @@ class TestCredentialRedaction:
         with patch("config.get_client", return_value=client):
             assert config.get_secret("test/id") == "https://hooks.slack.com/services/x"
         config.get_secret.cache_clear()
+
+
+class TestFallbackMessage:
+    """The degraded path is what a responder sees when Bedrock is down —
+    it has to be readable on its own."""
+
+    def test_raw_exception_never_reaches_slack(self):
+        import json
+        from unittest.mock import patch
+
+        import slack
+
+        raw = (
+            "An error occurred (ThrottlingException) when calling the InvokeModel "
+            "operation (reached max retries: 3): Too many tokens per day"
+        )
+        captured = {}
+        with patch("slack._post", side_effect=lambda p: captured.update(p) or True):
+            slack.post_fallback({"name": "X"}, raw)
+
+        body = json.dumps(captured)
+        assert "reached max retries" not in body
+        assert "InvokeModel" not in body
+        assert "quota is exhausted" in body
+
+    def test_known_failures_get_actionable_text(self):
+        import slack
+
+        cases = {
+            "Too many tokens per day": "quota",
+            "(AccessDeniedException) when calling": "model access",
+            "(ValidationException) bad model": "model ID",
+            "still holds the Terraform placeholder": "credential",
+        }
+        for raw, expected in cases.items():
+            assert expected in slack._explain_failure(raw), raw
+
+    def test_unknown_failure_points_at_the_logs(self):
+        import slack
+
+        assert "CloudWatch Logs" in slack._explain_failure("something entirely new")
+
+    def test_alert_description_precedes_the_failure_note(self):
+        """The problem, then the machinery."""
+        import json
+        from unittest.mock import patch
+
+        import slack
+
+        captured = {}
+        with patch("slack._post", side_effect=lambda p: captured.update(p) or True):
+            slack.post_fallback(
+                {"name": "HighErrorRate", "severity": "critical", "summary": "Error rate above 5%"},
+                "(ThrottlingException) throttled",
+            )
+        body = json.dumps(captured)
+        assert body.index("Error rate above 5%") < body.index("No AI summary")
