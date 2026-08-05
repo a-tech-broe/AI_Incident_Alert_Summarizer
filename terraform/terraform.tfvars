@@ -56,7 +56,7 @@ state_lock_table = "family_dyning"
 # --- CI/CD ----------------------------------------------------------------
 # Set to your repository to create the OIDC deployment role, then publish the
 # resulting github_actions_role_arn output as the AWS_ROLE_ARN repo variable.
-github_repository      = ""
+github_repository      = "a-tech-broe/AI_SRE"
 github_deploy_branches = ["main"]
 
 # Both workflow environments must be listed: a job declaring `environment:` gets
@@ -64,5 +64,7 @@ github_deploy_branches = ["main"]
 # makes the plan job fail at AssumeRoleWithWebIdentity.
 github_environments = ["plan", "production"]
 
-# The OIDC provider is account-wide. Set false if one already exists.
-create_github_oidc_provider = true
+# The OIDC provider is account-wide and already exists in this account
+# (arn:aws:iam::694992586025:oidc-provider/token.actions.githubusercontent.com).
+# Creating it again fails with EntityAlreadyExists.
+create_github_oidc_provider = false

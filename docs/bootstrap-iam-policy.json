@@ -1,0 +1,46 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ManageSummarizerLambda",
+      "Effect": "Allow",
+      "Action": "lambda:*",
+      "Resource": [
+        "arn:aws:lambda:*:694992586025:function:ai-incident-summarizer-*",
+        "arn:aws:lambda:*:694992586025:function:ai-incident-summarizer-*:*"
+      ]
+    },
+    {
+      "Sid": "ManageSummarizerEventBridge",
+      "Effect": "Allow",
+      "Action": "events:*",
+      "Resource": [
+        "arn:aws:events:*:694992586025:event-bus/ai-incident-summarizer-*",
+        "arn:aws:events:*:694992586025:rule/ai-incident-summarizer-*",
+        "arn:aws:events:*:694992586025:rule/ai-incident-summarizer-*/*",
+        "arn:aws:events:*:694992586025:archive/ai-incident-summarizer-*"
+      ]
+    },
+    {
+      "Sid": "ManageSummarizerDeadLetterQueue",
+      "Effect": "Allow",
+      "Action": "sqs:*",
+      "Resource": "arn:aws:sqs:*:694992586025:ai-incident-summarizer-*"
+    },
+    {
+      "Sid": "ManageSummarizerArtifactBucket",
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::ai-incident-summarizer-*",
+        "arn:aws:s3:::ai-incident-summarizer-*/*"
+      ]
+    },
+    {
+      "Sid": "ManageSummarizerRoles",
+      "Effect": "Allow",
+      "Action": "iam:*Role*",
+      "Resource": "arn:aws:iam::694992586025:role/ai-incident-summarizer-*"
+    }
+  ]
+}

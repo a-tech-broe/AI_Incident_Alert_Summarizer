@@ -57,6 +57,22 @@ jobs:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
+      # configure-aws-credentials reports a missing repository variable as
+      # "Input required and not supplied: aws-region", which says nothing about
+      # the actual cause. Fail here with the fix instead.
+      - name: Check required repository variables
+        run: |
+          missing=""
+          [ -n "${{ vars.AWS_ROLE_ARN }}" ] || missing="${missing} AWS_ROLE_ARN"
+          [ -n "${{ vars.AWS_REGION }}" ]   || missing="${missing} AWS_REGION"
+          if [ -n "${missing}" ]; then
+            echo "::error::Unset repository variable(s):${missing}"
+            echo "Set them under Settings > Secrets and variables > Actions > Variables."
+            echo "AWS_ROLE_ARN comes from the terraform output 'github_actions_role_arn';"
+            echo "it must be applied locally once before this pipeline can run."
+            exit 1
+          fi
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
@@ -135,6 +151,22 @@ jobs:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
+      # configure-aws-credentials reports a missing repository variable as
+      # "Input required and not supplied: aws-region", which says nothing about
+      # the actual cause. Fail here with the fix instead.
+      - name: Check required repository variables
+        run: |
+          missing=""
+          [ -n "${{ vars.AWS_ROLE_ARN }}" ] || missing="${missing} AWS_ROLE_ARN"
+          [ -n "${{ vars.AWS_REGION }}" ]   || missing="${missing} AWS_REGION"
+          if [ -n "${missing}" ]; then
+            echo "::error::Unset repository variable(s):${missing}"
+            echo "Set them under Settings > Secrets and variables > Actions > Variables."
+            echo "AWS_ROLE_ARN comes from the terraform output 'github_actions_role_arn';"
+            echo "it must be applied locally once before this pipeline can run."
+            exit 1
+          fi
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
@@ -183,6 +215,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+
+      # configure-aws-credentials reports a missing repository variable as
+      # "Input required and not supplied: aws-region", which says nothing about
+      # the actual cause. Fail here with the fix instead.
+      - name: Check required repository variables
+        run: |
+          missing=""
+          [ -n "${{ vars.AWS_ROLE_ARN }}" ] || missing="${missing} AWS_ROLE_ARN"
+          [ -n "${{ vars.AWS_REGION }}" ]   || missing="${missing} AWS_REGION"
+          if [ -n "${missing}" ]; then
+            echo "::error::Unset repository variable(s):${missing}"
+            echo "Set them under Settings > Secrets and variables > Actions > Variables."
+            echo "AWS_ROLE_ARN comes from the terraform output 'github_actions_role_arn';"
+            echo "it must be applied locally once before this pipeline can run."
+            exit 1
+          fi
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:

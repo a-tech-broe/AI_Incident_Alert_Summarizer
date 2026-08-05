@@ -291,5 +291,7 @@ only to public AWS and SaaS endpoints, so VPC attachment would add NAT gateway
 cost and cold-start latency for no isolation benefit. Add it if Splunk or
 Grafana sit inside private networking.
 
+First deployment into a fresh account: [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md).
+
 See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for operating and troubleshooting the
 deployed system.
