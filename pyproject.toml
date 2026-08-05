@@ -1,0 +1,51 @@
+[tool.ruff]
+line-length = 110
+target-version = "py313"
+src = ["lambda"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+    "C4",  # comprehensions
+    "SIM", # simplify
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter
+    "B008",  # function calls in defaults are used deliberately for boto clients
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into private helpers on purpose: the parsing and formatting
+# behaviour they pin down has no public surface worth widening for testability.
+"lambda/tests/*" = ["SLF001", "B017", "SIM117"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "alert",
+    "app",
+    "cloudwatch",
+    "config",
+    "ecs",
+    "grafana",
+    "http_client",
+    "prompt",
+    "slack",
+    "splunk",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["lambda/tests"]
+pythonpath = ["lambda"]
+addopts = "-ra --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+exclude = ["lambda/tests/"]

@@ -1,0 +1,191 @@
+name: CI
+
+# Everything here runs without AWS credentials, so it works on forks and gives
+# fast feedback before the plan job spends an OIDC session.
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.9.8"
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  terraform-lint:
+    name: Terraform fmt and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: terraform
+
+      # -backend=false is required, not cosmetic: backend.tf names a real S3
+      # bucket, and without the flag init would try to reach it. This job holds
+      # no AWS credentials by design, so that call fails — and validation only
+      # needs the provider schemas anyway.
+      - name: terraform init (no backend)
+        run: terraform init -backend=false -input=false
+        working-directory: terraform
+
+      - name: terraform validate
+        run: terraform validate
+        working-directory: terraform
+
+      - name: Validate each module in isolation
+        run: |
+          set -euo pipefail
+          for module in terraform/modules/*/; do
+            echo "::group::validate ${module}"
+            terraform -chdir="${module}" init -backend=false -input=false
+            terraform -chdir="${module}" validate
+            echo "::endgroup::"
+          done
+
+  tflint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      # --recursive resolves a relative --config against each directory it
+      # visits, so the config is pinned by absolute path instead.
+      - name: TFLint
+        working-directory: terraform
+        env:
+          TFLINT_CONFIG_FILE: ${{ github.workspace }}/terraform/.tflint.hcl
+        run: |
+          tflint --init
+          tflint --recursive --format compact
+
+  security-scan:
+    name: Checkov
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      # upload-sarif calls the workflow-runs API to attach the results to this
+      # run. Without actions:read that call 403s and the upload fails outright,
+      # even though the scan itself succeeded.
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to a commit SHA, not @master: a tag can be moved and a branch
+      # changes under us, either of which alters what runs in this pipeline with
+      # no commit on our side. SHA is the only immutable reference GitHub offers.
+      # Bump deliberately; the trailing comment records which tag it maps to.
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@9b70310bcd306d11740313070b940167d6b23085 # v12.3115.0
+        with:
+          directory: terraform
+          framework: terraform
+          quiet: true
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          # Findings are advisory on this repo; flip to false once the baseline
+          # is clean so regressions actually block a merge.
+          soft_fail: true
+
+      # Always keep the SARIF, regardless of where it can be published. On a
+      # private repo without Advanced Security this artifact is the only way to
+      # get the findings off the runner.
+      - name: Upload SARIF as an artifact
+        uses: actions/upload-artifact@v4
+        if: always() && hashFiles('checkov.sarif') != ''
+        with:
+          name: checkov-sarif-${{ github.run_id }}
+          path: checkov.sarif
+          retention-days: 30
+
+      # Publishing to the Security tab needs code scanning, which on a PRIVATE
+      # repo requires GitHub Advanced Security. Without it the upload fails with
+      # "Advanced Security must be enabled for this repository" — after the scan
+      # has already succeeded, so the job goes red for a reason unrelated to the
+      # code. Gated on an opt-in variable rather than left to fail.
+      #
+      # To turn on: make the repo public (code scanning is free there), or enable
+      # Advanced Security, then set repository variable ENABLE_CODE_SCANNING=true.
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && vars.ENABLE_CODE_SCANNING == 'true' && hashFiles('checkov.sarif') != ''
+        with:
+          sarif_file: checkov.sarif
+
+      - name: Summarize findings
+        if: always() && hashFiles('checkov.sarif') != ''
+        run: |
+          set -euo pipefail
+          total=$(jq '[.runs[].results[]] | length' checkov.sarif)
+          {
+            echo "## Checkov"
+            echo ""
+            echo "**${total}** finding(s). Full SARIF is attached as a workflow artifact."
+            if [ "${total}" -gt 0 ]; then
+              echo ""
+              echo "| Rule | Level | Location |"
+              echo "| --- | --- | --- |"
+              jq -r '
+                [.runs[].results[]][:25][]
+                | "| \(.ruleId // "?") | \(.level // "warning") | \(
+                    .locations[0].physicalLocation.artifactLocation.uri // "?"
+                  ):\(
+                    .locations[0].physicalLocation.region.startLine // 0
+                  ) |"
+              ' checkov.sarif
+              if [ "${total}" -gt 25 ]; then
+                echo ""
+                echo "_Showing 25 of ${total}; see the artifact for the rest._"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  python:
+    name: Lambda lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r lambda/requirements.txt
+          pip install -r lambda/requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check lambda
+
+      - name: Ruff format check
+        run: ruff format --check lambda
+
+      - name: mypy
+        run: mypy lambda --ignore-missing-imports
+        continue-on-error: true
+
+      - name: pytest
+        run: pytest lambda/tests -v --tb=short
+        env:
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}

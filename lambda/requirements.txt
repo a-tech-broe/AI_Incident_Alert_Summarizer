@@ -1,0 +1,10 @@
+# Runtime dependencies for the summarizer Lambda.
+#
+# boto3/botocore are deliberately absent: the Python 3.13 runtime ships them,
+# and bundling a second copy inflates the package and risks version skew with
+# the runtime's own credential handling. Pin them here only if a feature newer
+# than the runtime's bundled version is required.
+#
+# urllib3 is used for all outbound HTTP (Slack, Grafana, Splunk) rather than
+# `requests`, which would pull in a larger dependency tree for no benefit.
+urllib3>=2.2,<3.0

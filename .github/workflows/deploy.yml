@@ -1,0 +1,389 @@
+name: Deploy
+
+# The full pipeline from the project README:
+#
+#   fmt -> validate -> plan -> approval -> apply -> package -> upload -> update
+#
+# Infrastructure and application code are applied in that order deliberately:
+# Terraform owns the function's configuration, the package upload owns its code.
+# The Lambda module ignores changes to the code attributes precisely so these
+# two never fight over the same field.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_terraform:
+        description: "Deploy Lambda code only, leaving infrastructure untouched"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+# Never let two applies touch the same state. Queue instead of cancelling: a
+# cancelled apply can leave a lock behind.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.9.8"
+  PYTHON_VERSION: "3.13"
+  LAMBDA_ARCHITECTURE: "arm64"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. fmt -> validate -> plan
+  # -------------------------------------------------------------------------
+  plan:
+    name: Plan
+    if: ${{ !inputs.skip_terraform }}
+    runs-on: ubuntu-latest
+    environment: plan
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      # configure-aws-credentials reports a missing repository variable as
+      # "Input required and not supplied: aws-region", which says nothing about
+      # the actual cause. Fail here with the fix instead.
+      - name: Check required repository variables
+        run: |
+          missing=""
+          [ -n "${{ vars.AWS_ROLE_ARN }}" ] || missing="${missing} AWS_ROLE_ARN"
+          [ -n "${{ vars.AWS_REGION }}" ]   || missing="${missing} AWS_REGION"
+          if [ -n "${missing}" ]; then
+            echo "::error::Unset repository variable(s):${missing}"
+            echo "Set them under Settings > Secrets and variables > Actions > Variables."
+            echo "AWS_ROLE_ARN comes from the terraform output 'github_actions_role_arn';"
+            echo "it must be applied locally once before this pipeline can run."
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-plan-${{ github.run_id }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform init
+        run: |
+          terraform init -input=false
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode \
+            -var="github_repository=${{ github.repository }}" \
+            -out=tfplan
+          exit_code=$?
+          set -e
+
+          # -detailed-exitcode: 0 = no changes, 2 = changes present, 1 = error.
+          case "${exit_code}" in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *) echo "terraform plan failed"; exit 1 ;;
+          esac
+
+          terraform show -no-color tfplan > plan-full.txt
+
+      - name: Write plan to job summary
+        run: |
+          {
+            echo "## Terraform plan"
+            echo "Changes pending: \`${{ steps.plan.outputs.has_changes }}\`"
+            echo ""
+            echo '```terraform'
+            tail -c 50000 plan-full.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: terraform/tfplan
+          retention-days: 5
+
+  # -------------------------------------------------------------------------
+  # 2. Approval -> apply
+  #
+  # The `production` environment carries the required reviewers. The job pauses
+  # here until a human approves, and applies the exact plan file that was
+  # reviewed rather than re-planning against drifted state.
+  # -------------------------------------------------------------------------
+  apply:
+    name: Apply (approval required)
+    needs: plan
+    if: ${{ !inputs.skip_terraform && needs.plan.outputs.has_changes == 'true' }}
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      # configure-aws-credentials reports a missing repository variable as
+      # "Input required and not supplied: aws-region", which says nothing about
+      # the actual cause. Fail here with the fix instead.
+      - name: Check required repository variables
+        run: |
+          missing=""
+          [ -n "${{ vars.AWS_ROLE_ARN }}" ] || missing="${missing} AWS_ROLE_ARN"
+          [ -n "${{ vars.AWS_REGION }}" ]   || missing="${missing} AWS_REGION"
+          if [ -n "${missing}" ]; then
+            echo "::error::Unset repository variable(s):${missing}"
+            echo "Set them under Settings > Secrets and variables > Actions > Variables."
+            echo "AWS_ROLE_ARN comes from the terraform output 'github_actions_role_arn';"
+            echo "it must be applied locally once before this pipeline can run."
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-apply-${{ github.run_id }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: terraform
+
+      - name: terraform init
+        run: |
+          terraform init -input=false
+
+      - name: terraform apply
+        run: terraform apply -input=false -no-color -lock-timeout=5m -auto-approve tfplan
+
+      - name: Publish outputs to job summary
+        run: |
+          {
+            echo "## Applied"
+            echo '```json'
+            terraform output -json | jq 'map_values(.value)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # 3. package -> upload -> update function
+  # -------------------------------------------------------------------------
+  deploy-lambda:
+    name: Package and deploy Lambda
+    needs: [plan, apply]
+    # `always()` plus explicit result checks: apply is skipped when there are no
+    # infrastructure changes, and a code-only deploy must still proceed.
+    if: |
+      always() &&
+      (needs.plan.result == 'success' || needs.plan.result == 'skipped') &&
+      (needs.apply.result == 'success' || needs.apply.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # configure-aws-credentials reports a missing repository variable as
+      # "Input required and not supplied: aws-region", which says nothing about
+      # the actual cause. Fail here with the fix instead.
+      - name: Check required repository variables
+        run: |
+          missing=""
+          [ -n "${{ vars.AWS_ROLE_ARN }}" ] || missing="${missing} AWS_ROLE_ARN"
+          [ -n "${{ vars.AWS_REGION }}" ]   || missing="${missing} AWS_REGION"
+          if [ -n "${missing}" ]; then
+            echo "::error::Unset repository variable(s):${missing}"
+            echo "Set them under Settings > Secrets and variables > Actions > Variables."
+            echo "AWS_ROLE_ARN comes from the terraform output 'github_actions_role_arn';"
+            echo "it must be applied locally once before this pipeline can run."
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: Resolve deployment targets
+        id: targets
+        run: |
+          set -euo pipefail
+          # Read from Terraform outputs rather than hard-coding names, so a
+          # rename in Terraform cannot silently deploy to a stale function.
+          cd terraform
+          terraform init -input=false >/dev/null
+
+          {
+            echo "function_name=$(terraform output -raw lambda_function_name)"
+            echo "bucket=$(terraform output -raw artifacts_bucket)"
+            echo "key=$(terraform output -raw artifacts_bucket_key)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Package Lambda
+        id: package
+        run: |
+          set -euo pipefail
+          rm -rf build && mkdir -p build
+
+          # Wheels must match the function's architecture, not the runner's.
+          # Installing without these flags silently produces an x86_64 package
+          # that fails at import time on an arm64 function.
+          pip install \
+            --requirement lambda/requirements.txt \
+            --target build \
+            --platform manylinux2014_aarch64 \
+            --implementation cp \
+            --python-version ${{ env.PYTHON_VERSION }} \
+            --only-binary=:all: \
+            --upgrade
+
+          cp lambda/*.py build/
+          rm -rf build/tests
+
+          # Deterministic zip: fixed timestamps and sorted entries mean an
+          # unchanged source tree produces an identical hash, so a redeploy of
+          # the same code is a visible no-op.
+          find build -exec touch -t 198001010000.00 {} +
+          cd build && zip -qrX ../deployment-package.zip . -x '*.pyc' '*__pycache__*' && cd ..
+
+          echo "sha256=$(openssl dgst -sha256 -binary deployment-package.zip | openssl base64)" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c%s deployment-package.zip)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload package to S3
+        run: |
+          set -euo pipefail
+          aws s3 cp deployment-package.zip \
+            "s3://${{ steps.targets.outputs.bucket }}/${{ steps.targets.outputs.key }}" \
+            --metadata "git-sha=${{ github.sha }},run-id=${{ github.run_id }}"
+
+      - name: Update function code
+        id: update
+        run: |
+          set -euo pipefail
+          version=$(aws lambda update-function-code \
+            --function-name "${{ steps.targets.outputs.function_name }}" \
+            --s3-bucket "${{ steps.targets.outputs.bucket }}" \
+            --s3-key "${{ steps.targets.outputs.key }}" \
+            --publish \
+            --query 'Version' --output text)
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          # update-function-code returns before the new code is active; shifting
+          # the alias early would point it at a version that cannot yet serve.
+          aws lambda wait function-updated \
+            --function-name "${{ steps.targets.outputs.function_name }}"
+
+      - name: Smoke test the new version
+        id: smoke
+        run: |
+          set -euo pipefail
+          # A resolved alert: exercises parsing and the handler path end to end
+          # without spending a Bedrock call or posting to Slack.
+          cat > smoke-event.json <<'JSON'
+          {
+            "alerts": [{
+              "status": "resolved",
+              "labels": {"alertname": "deployment-smoke-test", "severity": "low"},
+              "annotations": {"summary": "Synthetic event from the deploy pipeline"},
+              "startsAt": "2020-01-01T00:00:00Z",
+              "fingerprint": "smoketest"
+            }],
+            "status": "resolved"
+          }
+          JSON
+
+          aws lambda invoke \
+            --function-name "${{ steps.targets.outputs.function_name }}:${{ steps.update.outputs.version }}" \
+            --payload fileb://smoke-event.json \
+            --cli-read-timeout 90 \
+            response.json > invoke-meta.json
+
+          cat invoke-meta.json response.json
+
+          if jq -e '.FunctionError' invoke-meta.json >/dev/null; then
+            echo "::error::Smoke test failed — the new version raised an error"
+            exit 1
+          fi
+
+      - name: Promote the live alias
+        run: |
+          set -euo pipefail
+          aws lambda update-alias \
+            --function-name "${{ steps.targets.outputs.function_name }}" \
+            --name live \
+            --function-version "${{ steps.update.outputs.version }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Lambda deployment"
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Function | \`${{ steps.targets.outputs.function_name }}\` |"
+            echo "| Version | \`${{ steps.update.outputs.version }}\` |"
+            echo "| Package size | ${{ steps.package.outputs.size }} bytes |"
+            echo "| SHA256 | \`${{ steps.package.outputs.sha256 }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Rollback guidance on failure. Deliberately not automatic: a failed smoke
+  # test may indicate a bad deploy or a broken dependency, and reverting the
+  # alias on the second case hides the real fault.
+  # -------------------------------------------------------------------------
+  on-failure:
+    name: Report failure
+    needs: [plan, apply, deploy-lambda]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rollback instructions
+        run: |
+          {
+            echo "## Deployment failed"
+            echo ""
+            echo "The \`live\` alias still points at the last known-good version."
+            echo "To inspect or roll back explicitly:"
+            echo ""
+            echo '```bash'
+            echo "aws lambda list-versions-by-function --function-name <name>"
+            echo "aws lambda update-alias --function-name <name> --name live --function-version <previous>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
