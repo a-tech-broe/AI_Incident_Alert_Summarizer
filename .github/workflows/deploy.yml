@@ -216,6 +216,15 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # This job resolves the function and bucket names from Terraform outputs
+      # rather than hardcoding them, so it needs the CLI even though it applies
+      # nothing. terraform_wrapper: false keeps `terraform output -raw` clean —
+      # the wrapper appends its own stdout, which would corrupt the values.
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
       # configure-aws-credentials reports a missing repository variable as
       # "Input required and not supplied: aws-region", which says nothing about
       # the actual cause. Fail here with the fix instead.
