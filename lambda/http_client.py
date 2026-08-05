@@ -8,8 +8,10 @@ these calls need.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import urllib3
 from urllib3.util.retry import Retry
@@ -83,12 +85,48 @@ def request(
     try:
         response = pool.request(method, url, **kwargs)
     except urllib3.exceptions.HTTPError as exc:
-        raise HttpError(f"{method} {_redact(url)} failed: {exc}") from exc
+        # Scrub the exception text, not just our own message: urllib3 embeds the
+        # full URL in "Max retries exceeded with url: ...", and for a Slack
+        # webhook the path *is* the credential. Interpolating the raw exception
+        # writes that credential to CloudWatch Logs.
+        raise HttpError(f"{method} {_redact(url)} failed: {_scrub(str(exc), url)}") from exc
 
     return HttpResponse(status=response.status, body=response.data.decode("utf-8", errors="replace"))
 
 
+# Matches absolute and protocol-relative URLs, which is the form urllib3 uses
+# in its own error messages.
+_URLISH = re.compile(r"(?:https?:)?//[^\s'\"<>\\)]+")
+
+
 def _redact(url: str) -> str:
-    """Strip the path from webhook URLs before they reach a log line."""
-    parts = url.split("/", 3)
-    return "/".join(parts[:3]) + "/…" if len(parts) > 3 else url
+    """Reduce a URL to scheme and host. The path may be a bearer credential."""
+    candidate = url.strip()
+    try:
+        parts = urlsplit(candidate if "//" in candidate else f"//{candidate}")
+        host = parts.netloc
+    except ValueError:
+        return "<unparseable url>"
+
+    if not host:
+        return "<url>"
+
+    scheme = f"{parts.scheme}://" if parts.scheme else "//"
+    return f"{scheme}{host}/…" if (parts.path or parts.query) else f"{scheme}{host}"
+
+
+def _scrub(text: str, url: str | None = None) -> str:
+    """Redact every URL appearing anywhere in a message.
+
+    The regex catches well-formed URLs, but a malformed one (a pasted secret
+    with an embedded space, say) can survive it. So when the request URL is
+    known, its path is removed by literal substring match first — that path is
+    the credential, and this does not depend on the message's shape.
+    """
+    if url:
+        path = urlsplit(url.strip() if "//" in url else f"//{url.strip()}").path
+        # Guard against a single-slash path matching half the message.
+        if path and len(path) > 1:
+            text = text.replace(path, "/…")
+
+    return _URLISH.sub(lambda m: _redact(m.group(0)), text)

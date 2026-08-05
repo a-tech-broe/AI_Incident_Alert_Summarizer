@@ -264,11 +264,51 @@ fields @timestamp, input_tokens, output_tokens | filter event = "bedrock_invoke_
 
 ## Cost
 
-Dominated by Bedrock. At roughly 4k input / 600 output tokens per alert, expect
-a few cents per summary on Claude Sonnet; Lambda, EventBridge and CloudWatch are
-rounding errors at incident volumes. Two controls bound the worst case:
-`lambda_reserved_concurrency` caps parallel invocations during an alert storm,
-and resolved alerts are dropped before any model call.
+Two components: a flat monthly floor, and a per-alert charge dominated by Bedrock.
+
+**Fixed, at zero alerts — about $3.10/month:**
+
+| Item | Monthly |
+| --- | --- |
+| Secrets Manager — 4 secrets × $0.40 | $1.60 |
+| CloudWatch alarms — 6 × $0.10 | $0.60 |
+| CloudWatch custom metrics — 3 × $0.30 | $0.90 |
+| Dashboard (1; first 3 are free) | $0.00 |
+| S3 artifacts, SQS, EventBridge, SNS, idle Lambda | <$0.02 |
+
+**Per alert — about $0.025**, of which Bedrock is ~97%. A fully-enriched alert
+sends roughly 5k input tokens (alert payload plus six telemetry sources) and
+generates ~600 output. Lambda is ~$0.0001 per invocation at 512 MB arm64; the
+Logs Insights query is ~$0.0003; everything else is noise.
+
+| Alerts / month | Monthly total |
+| --- | --- |
+| 100 | ~$6 |
+| 500 | ~$16 |
+| 1,000 | ~$28 |
+| 5,000 | ~$128 |
+
+Three things worth knowing:
+
+- **Prompt caching does not apply.** The system prompt is ~600 tokens, under the
+  1,024-token minimum cacheable prefix for Sonnet-tier models — the cache is
+  silently never written. Enlarging the prompt to cross that line would cost more
+  than it saves at these volumes.
+- **Resolved alerts are dropped before any model call**, so recovery notices are
+  free. In a flapping-alert incident that is most of the traffic.
+- **`lambda_reserved_concurrency` is currently `-1`** (no reservation) because
+  this account's total Lambda concurrency quota is 10, which already caps
+  parallel Bedrock calls harder than a reservation would. If that quota is
+  raised, set the reservation or a flapping rule can fan out across the new
+  headroom — see `docs/BOOTSTRAP.md`.
+
+Measure rather than trust the estimate: every summary logs its real token counts.
+
+```
+fields @timestamp, input_tokens, output_tokens
+| filter event = "bedrock_invoke_succeeded"
+| stats sum(input_tokens) as in, sum(output_tokens) as out, count(*) as calls by bin(1d)
+```
 
 ---
 

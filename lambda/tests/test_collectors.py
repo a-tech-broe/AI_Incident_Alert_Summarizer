@@ -201,3 +201,52 @@ class TestSlackFormatting:
     def test_sources_line_lists_only_available_sources(self):
         line = slack._sources_line({"ecs_service": {"available": True}, "splunk": {"available": False}})
         assert "ecs service" in line and "splunk" not in line
+
+
+class TestCredentialRedaction:
+    """A Slack webhook's path is its credential — it must never reach a log."""
+
+    def test_redact_strips_the_path(self):
+        import http_client
+
+        assert (
+            http_client._redact("https://hooks.slack.com/services/T0/B0/secret")
+            == "https://hooks.slack.com/…"
+        )
+
+    def test_scrub_removes_url_embedded_in_exception_text(self):
+        import http_client
+
+        # The exact shape urllib3 produces, which previously leaked verbatim.
+        raw = (
+            "HTTPConnectionPool(host='hooks.slack.com', port=443): Max retries "
+            "exceeded with url: //hooks.slack.com/services/T0/B0/SUPERSECRET"
+        )
+        scrubbed = http_client._scrub(raw)
+        assert "SUPERSECRET" not in scrubbed
+        assert "hooks.slack.com" in scrubbed
+
+    def test_scrub_removes_the_known_path_even_when_malformed(self):
+        """A space-corrupted URL defeats the regex; the literal path match is
+        the backstop, because that path is the credential."""
+        import http_client
+
+        target = "https://hooks.slack.com/services/T0/B0/SUPERSECRET"
+        raw = "InvalidURL: ' https'  // hooks.slack.com/services/T0/B0/SUPERSECRET"
+        assert "SUPERSECRET" not in http_client._scrub(raw, target)
+
+    def test_secret_values_are_stripped(self):
+        """A pasted leading space survives JSON encoding invisibly."""
+        import json as _json
+        from unittest.mock import MagicMock, patch
+
+        import config
+
+        client = MagicMock()
+        client.get_secret_value.return_value = {
+            "SecretString": _json.dumps({"value": "  https://hooks.slack.com/services/x  "})
+        }
+        config.get_secret.cache_clear()
+        with patch("config.get_client", return_value=client):
+            assert config.get_secret("test/id") == "https://hooks.slack.com/services/x"
+        config.get_secret.cache_clear()
