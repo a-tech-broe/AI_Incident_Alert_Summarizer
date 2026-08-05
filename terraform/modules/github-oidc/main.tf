@@ -10,12 +10,44 @@ locals {
 
   oidc_provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : "arn:${local.partition}:iam::${local.account_id}:oidc-provider/token.actions.githubusercontent.com"
 
-  # `sub` claims the role will accept. Branch refs cover plan on push; the
-  # environment claims cover the approval-gated apply job, which runs against a
-  # protected GitHub environment rather than a bare branch.
-  branch_subjects      = [for b in var.allowed_branches : "repo:${var.github_repository}:ref:refs/heads/${b}"]
-  environment_subjects = [for e in var.allowed_environments : "repo:${var.github_repository}:environment:${e}"]
-  pull_request_subject = var.allow_pull_requests ? ["repo:${var.github_repository}:pull_request"] : []
+  repo_owner = split("/", var.github_repository)[0]
+  repo_name  = split("/", var.github_repository)[1]
+
+  # GitHub issues `sub` in one of two shapes, and which one a repository gets is
+  # a GitHub-side setting we do not control:
+  #
+  #   repo:owner/name:...                    the historical form
+  #   repo:owner@<owner-id>/name@<repo-id>:… the immutable-subject form
+  #
+  # The immutable form embeds numeric IDs so a renamed or re-created repository
+  # cannot inherit a trust relationship granted to its old name. The IDs are not
+  # knowable at plan time, so the second form is matched with wildcards. Check a
+  # repository's actual shape with:
+  #
+  #   gh api repos/OWNER/REPO/actions/oidc/customization/sub
+  #
+  # Trusting only one form is the failure this guards against: every other part
+  # of the configuration looks correct and STS still returns
+  # "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+  repo_forms = [
+    var.github_repository,
+    "${local.repo_owner}@*/${local.repo_name}@*",
+  ]
+
+  # Branch refs cover plan on push; the environment claims cover the
+  # approval-gated apply job, which runs against a protected GitHub environment
+  # rather than a bare branch.
+  branch_subjects = flatten([
+    for r in local.repo_forms : [for b in var.allowed_branches : "repo:${r}:ref:refs/heads/${b}"]
+  ])
+
+  environment_subjects = flatten([
+    for r in local.repo_forms : [for e in var.allowed_environments : "repo:${r}:environment:${e}"]
+  ])
+
+  pull_request_subject = var.allow_pull_requests ? [
+    for r in local.repo_forms : "repo:${r}:pull_request"
+  ] : []
 
   allowed_subjects = concat(local.branch_subjects, local.environment_subjects, local.pull_request_subject)
 }
