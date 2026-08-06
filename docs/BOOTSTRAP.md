@@ -66,7 +66,20 @@ aws iam list-attached-user-policies --user-name Parah \
 ## Step 2 — Request Bedrock model access
 
 Independent of everything else, and easy to forget: the stack applies cleanly
-without it and then every invocation fails with `AccessDeniedException`.
+without it and then every invocation fails.
+
+Bedrock needs **two** grants, and they fail differently:
+
+| Grant | Missing looks like |
+| --- | --- |
+| Authorization (Model access) | `AccessDeniedException` |
+| Throughput (Service Quotas) | `ThrottlingException: Too many tokens per day` |
+
+The second is the confusing one — it reads like a limit you consumed, but a
+brand-new account can sit at a quota of `0`, which never resets into anything
+usable. Granting model access again does not fix it. See
+[`RUNBOOK.md`](RUNBOOK.md#bedrock-errors) for the commands that distinguish the
+two before you act.
 
 Enable **Anthropic → Claude Sonnet 4.5** at
 <https://us-east-1.console.aws.amazon.com/bedrock/home?region=us-east-1#/modelaccess>.

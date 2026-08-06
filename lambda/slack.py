@@ -40,11 +40,14 @@ _MAX_TEXT = 2800
 # wins, so put the more specific patterns first.
 _FAILURE_REASONS: tuple[tuple[str, str], ...] = (
     # A per-day quota of 0 also surfaces as "too many tokens", so this cannot
-    # promise a reset — zero never resets into anything usable.
+    # promise a reset — zero never resets into anything usable. Nor does it
+    # imply missing model access: authorization and throughput are separate
+    # grants, and an AUTHORIZED model can still have no capacity allocated.
     (
         "Too many tokens",
-        "Bedrock rejected the request on a token quota. If the per-day quota for this "
-        "model is 0, model access is not enabled — check Bedrock → Model access.",
+        "Bedrock token quota exceeded. If the model is AUTHORIZED but its quota is 0, "
+        "throughput is not allocated to this account — needs a Service Quotas or "
+        "Support request, not a model-access grant.",
     ),
     ("ThrottlingException", "Bedrock is throttling requests. Retry shortly."),
     ("AccessDeniedException", "Bedrock model access is not granted for this account and region."),
