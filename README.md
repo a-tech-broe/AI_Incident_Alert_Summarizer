@@ -136,9 +136,11 @@ dependency cycle (`iam → eventbridge → lambda → iam`).
 - Terraform ≥ 1.6, Python 3.13, AWS CLI
 - Remote state is already configured in `terraform/backend.tf` — bucket
   `bokiti123`, lock table `family_dyning`, both in `us-east-1`
-- **Bedrock model access requested** for your account and region — the first
-  apply succeeds without it, but every invocation will fail with
-  `AccessDeniedException` until it is granted
+- **Bedrock usable in your account and region** — both the model *authorization*
+  and a non-zero *throughput quota*. They are separate grants: an authorized
+  model with zero quota fails every invocation with a `ThrottlingException` that
+  reads like a transient limit. The first apply succeeds either way; see
+  [`docs/RUNBOOK.md`](docs/RUNBOOK.md#bedrock-errors) for how to tell them apart
 
 ### 1. Configure and apply
 

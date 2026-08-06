@@ -273,13 +273,13 @@ class TestFallbackMessage:
         body = json.dumps(captured)
         assert "reached max retries" not in body
         assert "InvokeModel" not in body
-        assert "Model access" in body
+        assert "throughput is not allocated" in body
 
     def test_known_failures_get_actionable_text(self):
         import slack
 
         cases = {
-            "Too many tokens per day": "Model access",
+            "Too many tokens per day": "throughput is not allocated",
             "(AccessDeniedException) when calling": "model access",
             "(ValidationException) bad model": "model ID",
             "still holds the Terraform placeholder": "credential",

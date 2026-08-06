@@ -158,33 +158,61 @@ Purge the queue once the replay succeeds, so the DLQ alarm clears.
 | `ThrottlingException` | Token quota exceeded — **or the quota is 0** | Check the quota before assuming it will reset; see below |
 | `ModelTimeoutException` | Generation exceeded the read timeout | Lower `bedrock_max_tokens`, or raise the timeout in `config.py` |
 
-Model access is the one that bites on a fresh account: everything applies
-cleanly, and every invocation fails.
+On a fresh account everything applies cleanly and every invocation still fails.
+Resist assuming it is model access — verify, because the two failure modes look
+similar and only one is fixed in the Model access console.
 
 ### `ThrottlingException` does not always mean "wait and retry"
 
-An account with **no** Bedrock entitlement reports a per-day token quota of `0`,
-and the first token then exceeds it — surfacing as
-`ThrottlingException: Too many tokens per day`. That reads like a limit you have
-consumed, but zero never resets into anything usable. Check before waiting:
+Bedrock grants two things independently, and only one of them is what people
+mean by "model access":
+
+| Grant | What it controls | Where it lives |
+| --- | --- | --- |
+| **Authorization** | May this account use the model at all | Bedrock → Model access |
+| **Throughput** | How many tokens/requests it may spend | Service Quotas |
+
+An account can be fully authorized and still have **zero** throughput. The first
+token then exceeds the quota and surfaces as
+`ThrottlingException: Too many tokens per day` — which reads like a limit you
+consumed. Zero never resets into anything usable, and granting model access a
+second time changes nothing.
+
+Check both before acting. Authorization:
 
 ```bash
-aws service-quotas list-service-quotas --service-code bedrock --max-items 400 \
-  --query 'Quotas[?contains(QuotaName,`tokens per day`)].[Value,Adjustable,QuotaName]' \
-  --output text | sort -n | head
+python3 -c "
+import boto3
+r = boto3.client('bedrock', region_name='us-east-1').get_foundation_model_availability(
+    modelId='anthropic.claude-sonnet-4-5-20250929-v1:0')
+print(r['authorizationStatus'], r['entitlementAvailability'], r['regionAvailability'])
+"
 ```
 
-Read the result like this:
+Then throughput:
 
-| What you see | Meaning |
-| --- | --- |
-| Every model `0`, per-day rows `Adjustable: False` | Bedrock is not enabled for the account. Grant model access in the console — a Service Quotas increase request cannot fix a non-adjustable zero. |
-| Your model `0`, others non-zero | That specific model is not enabled. Grant access to it, or point `bedrock_model_id` at one that is. |
-| Your model non-zero | A genuine rate limit. Lower `lambda_reserved_concurrency`, or request an increase on the adjustable per-minute quotas. |
+```bash
+aws service-quotas list-service-quotas --service-code bedrock --max-items 500 \
+  --query 'Quotas[?contains(QuotaName,`Sonnet 4.5`)].[Value,Adjustable,QuotaName]' \
+  --output text
+```
 
-The per-**day** quotas are typically `Adjustable: False` (they track entitlement)
-while the per-**minute** ones are adjustable (they track rate). If the
-non-adjustable one is zero, the fix is model access, not a quota request.
+Read the two together:
+
+| Authorization | Quota | Meaning |
+| --- | --- | --- |
+| Not `AUTHORIZED` | — | Genuine access problem. Grant it in Bedrock → Model access. |
+| `AUTHORIZED` | `0` everywhere | Authorized but no capacity allocated. **Model access will not fix this.** Request an increase on the adjustable per-minute quotas, and open a Support case for the non-adjustable per-day ones. New accounts often sit here until activation completes. |
+| `AUTHORIZED` | non-zero | A real rate limit. Lower `lambda_reserved_concurrency`, or raise the per-minute quota. |
+
+Switching `bedrock_model_id` only helps in the middle case if *another* model has
+non-zero quota — check before assuming. When every Anthropic model reads zero
+while other vendors in the same account do not, the gap is Anthropic-specific
+capacity, not a per-model setting.
+
+Note the split: per-**day** quotas are typically `Adjustable: False` and per-**minute**
+ones adjustable. A non-adjustable zero cannot be raised through Service Quotas
+at all — that one needs Support.
 
 Watch token spend:
 
