@@ -8,6 +8,7 @@
 # Usage:
 #   scripts/smoke-test.sh                 # firing alert (spends a Bedrock call)
 #   scripts/smoke-test.sh --resolved      # parse/route only, no model call
+#   scripts/smoke-test.sh --cloudwatch    # CloudWatch alarm payload shape
 #   scripts/smoke-test.sh --no-cold-start # skip the container drain
 #
 set -euo pipefail
@@ -21,11 +22,13 @@ LOG_GROUP="/aws/lambda/${FUNC}"
 
 STATUS="firing"
 COLD_START=1
+SHAPE="grafana"
 for arg in "$@"; do
   case "$arg" in
     --resolved)      STATUS="resolved" ;;
+    --cloudwatch)    SHAPE="cloudwatch" ;;
     --no-cold-start) COLD_START=0 ;;
-    -h|--help)       sed -n '2,14p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -53,18 +56,37 @@ fi
 # 2. Publish
 # ---------------------------------------------------------------------------
 say "Publishing a ${STATUS} alert to ${BUS}"
-DETAIL=$(python3 - "$ALERT" "$STATUS" <<'PY'
+DETAIL=$(python3 - "$ALERT" "$STATUS" "$SHAPE" <<'PY'
 import json, sys
-name, status = sys.argv[1], sys.argv[2]
-print(json.dumps({
-    "alerts": [{
+name, status, shape = sys.argv[1], sys.argv[2], sys.argv[3]
+
+if shape == "cloudwatch":
+    # The shape AWS emits for "CloudWatch Alarm State Change". Exercised here
+    # because its `state` is an object, not a string — a difference that once
+    # caused every alarm to be silently dropped as resolved.
+    print(json.dumps({
+        "alarmName": name,
+        "state": {
+            "value": "ALARM" if status == "firing" else "OK",
+            "reason": "Threshold Crossed: 3 datapoints above 10.0 (synthetic)",
+        },
+        "configuration": {
+            "description": "Synthetic alarm from scripts/smoke-test.sh",
+            "metrics": [{"metricStat": {"metric": {"dimensions": {
+                "service": "checkout-api", "InstanceId": "i-0synthetic",
+            }}}}],
+        },
+    }))
+else:
+    print(json.dumps({
+        "alerts": [{
+            "status": status,
+            "labels": {"alertname": name, "severity": "critical", "service": "checkout-api"},
+            "annotations": {"summary": "Synthetic alert from scripts/smoke-test.sh"},
+            "fingerprint": name,
+        }],
         "status": status,
-        "labels": {"alertname": name, "severity": "critical", "service": "checkout-api"},
-        "annotations": {"summary": "Synthetic alert from scripts/smoke-test.sh"},
-        "fingerprint": name,
-    }],
-    "status": status,
-}))
+    }))
 PY
 )
 ENTRY=$(python3 - "$BUS" "$DETAIL" <<'PY'
