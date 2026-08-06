@@ -78,12 +78,21 @@ lambda/
 ├── prompt.py          Prompt construction and Bedrock invocation
 ├── slack.py           Block Kit formatting and delivery
 ├── http_client.py     Shared HTTP with per-purpose retry budgets
-└── tests/             78 tests, no AWS calls required
+└── tests/             92 tests, no AWS calls required
 
 .github/workflows/
 ├── ci.yml             fmt, validate, tflint, checkov, ruff, pytest
 ├── terraform-plan.yml Plan on PR, posted as a comment
 └── deploy.yml         plan → approval → apply → package → upload → update
+
+scripts/
+└── smoke-test.sh      End-to-end probe: EventBridge → Lambda → Slack
+
+docs/
+├── BOOTSTRAP.md       First deployment into a fresh account
+├── INTEGRATIONS.md    Feeding it from an existing workload
+├── RUNBOOK.md         Operating and troubleshooting
+└── SPEC.md            The original brief
 ```
 
 ---
@@ -332,6 +341,9 @@ cost and cold-start latency for no isolation benefit. Add it if Splunk or
 Grafana sit inside private networking.
 
 First deployment into a fresh account: [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md).
+
+Wiring an existing workload in as a signal source — CloudWatch alarms or
+direct `PutEvents` from your application: [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md).
 
 See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for operating and troubleshooting the
 deployed system.
