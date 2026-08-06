@@ -145,3 +145,69 @@ class TestAlertProperties:
     def test_alerting_status_counts_as_firing(self):
         """Legacy Grafana emits `alerting` rather than `firing`."""
         assert alert_parser.Alert(name="X", status="alerting").is_firing is True
+
+
+class TestCloudWatchAlarmParsing:
+    """CloudWatch's `state` is an object, not a string. Falling through to the
+    generic flat path stringifies it, fails is_firing, and silently drops the
+    alarm as resolved — so this shape gets its own path."""
+
+    def _event(self, value: str = "ALARM") -> dict:
+        return {
+            "source": "aws.cloudwatch",
+            "detail-type": "CloudWatch Alarm State Change",
+            "detail": {
+                "alarmName": "banking-platform-api-5xx",
+                "state": {
+                    "value": value,
+                    "reason": "Threshold Crossed: 3 datapoints above 10.0",
+                    "timestamp": "2026-08-06T10:00:00+0000",
+                },
+                "configuration": {
+                    "description": "API 5xx rate above threshold",
+                    "metrics": [
+                        {
+                            "metricStat": {
+                                "metric": {
+                                    "dimensions": {
+                                        "service": "checkout-api",
+                                        "InstanceId": "i-0abc",
+                                    }
+                                }
+                            }
+                        }
+                    ],
+                },
+            },
+        }
+
+    def test_alarm_state_is_firing(self):
+        alerts, _ = alert_parser.parse(self._event("ALARM"))
+        assert alerts[0].is_firing is True
+
+    def test_ok_state_is_not_firing(self):
+        alerts, _ = alert_parser.parse(self._event("OK"))
+        assert alerts[0].is_firing is False
+
+    def test_insufficient_data_is_not_firing(self):
+        """Noisy by default — a metric that stopped reporting deserves its own
+        alarm rather than paging through this one."""
+        alerts, _ = alert_parser.parse(self._event("INSUFFICIENT_DATA"))
+        assert alerts[0].is_firing is False
+
+    def test_reason_and_description_are_extracted(self):
+        alerts, _ = alert_parser.parse(self._event())
+        assert "Threshold Crossed" in alerts[0].summary
+        assert alerts[0].description == "API 5xx rate above threshold"
+
+    def test_dimensions_become_labels_so_service_resolves(self):
+        """Without this the alert has no service, and every enrichment source
+        that needs one reports unavailable."""
+        alerts, _ = alert_parser.parse(self._event())
+        assert alerts[0].service == "checkout-api"
+        assert alerts[0].labels["InstanceId"] == "i-0abc"
+
+    def test_grafana_payload_still_takes_the_grafana_path(self):
+        """The new branch must not shadow the existing one."""
+        alerts, _ = alert_parser.parse({"alerts": [{"status": "firing", "labels": {"alertname": "X"}}]})
+        assert alerts[0].name == "X" and alerts[0].is_firing

@@ -205,11 +205,13 @@ module "eventbridge" {
   target_lambda_arn  = module.lambda.function_arn
   target_lambda_name = module.lambda.function_name
 
-  event_sources      = var.event_sources
-  event_detail_types = var.event_detail_types
-  max_retry_attempts = var.event_max_retry_attempts
-  dlq_arn            = aws_sqs_queue.dlq.arn
-  dlq_url            = aws_sqs_queue.dlq.url
+  event_sources                 = var.event_sources
+  event_detail_types            = var.event_detail_types
+  max_retry_attempts            = var.event_max_retry_attempts
+  forward_cloudwatch_alarms     = var.forward_cloudwatch_alarms
+  forwarded_alarm_name_prefixes = var.forwarded_alarm_name_prefixes
+  dlq_arn                       = aws_sqs_queue.dlq.arn
+  dlq_url                       = aws_sqs_queue.dlq.url
 
   tags = local.common_tags
 }

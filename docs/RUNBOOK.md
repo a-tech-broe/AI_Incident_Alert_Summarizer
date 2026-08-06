@@ -155,11 +155,36 @@ Purge the queue once the replay succeeds, so the DLQ alarm clears.
 | --- | --- | --- |
 | `AccessDeniedException` | Model access not granted | Request access in the Bedrock console for this account **and region** |
 | `ValidationException` | Bad model ID | Cross-region profiles need the geography prefix (`us.`) and must exist in your region |
-| `ThrottlingException` | Account quota exceeded | Lower `lambda_reserved_concurrency`, or request a quota increase |
+| `ThrottlingException` | Token quota exceeded — **or the quota is 0** | Check the quota before assuming it will reset; see below |
 | `ModelTimeoutException` | Generation exceeded the read timeout | Lower `bedrock_max_tokens`, or raise the timeout in `config.py` |
 
 Model access is the one that bites on a fresh account: everything applies
 cleanly, and every invocation fails.
+
+### `ThrottlingException` does not always mean "wait and retry"
+
+An account with **no** Bedrock entitlement reports a per-day token quota of `0`,
+and the first token then exceeds it — surfacing as
+`ThrottlingException: Too many tokens per day`. That reads like a limit you have
+consumed, but zero never resets into anything usable. Check before waiting:
+
+```bash
+aws service-quotas list-service-quotas --service-code bedrock --max-items 400 \
+  --query 'Quotas[?contains(QuotaName,`tokens per day`)].[Value,Adjustable,QuotaName]' \
+  --output text | sort -n | head
+```
+
+Read the result like this:
+
+| What you see | Meaning |
+| --- | --- |
+| Every model `0`, per-day rows `Adjustable: False` | Bedrock is not enabled for the account. Grant model access in the console — a Service Quotas increase request cannot fix a non-adjustable zero. |
+| Your model `0`, others non-zero | That specific model is not enabled. Grant access to it, or point `bedrock_model_id` at one that is. |
+| Your model non-zero | A genuine rate limit. Lower `lambda_reserved_concurrency`, or request an increase on the adjustable per-minute quotas. |
+
+The per-**day** quotas are typically `Adjustable: False` (they track entitlement)
+while the per-**minute** ones are adjustable (they track rate). If the
+non-adjustable one is zero, the fix is model access, not a quota request.
 
 Watch token spend:
 

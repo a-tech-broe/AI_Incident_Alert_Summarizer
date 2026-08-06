@@ -165,6 +165,18 @@ variable "event_max_retry_attempts" {
 # Downstream integrations
 # ---------------------------------------------------------------------------
 
+variable "forward_cloudwatch_alarms" {
+  description = "Republish CloudWatch alarm state changes onto the alerts bus, so an existing EC2/ALB/RDS workload can feed the summarizer without application changes."
+  type        = bool
+  default     = false
+}
+
+variable "forwarded_alarm_name_prefixes" {
+  description = "Only forward alarms whose name starts with one of these. Empty forwards every alarm in the account — set this when other projects share it."
+  type        = list(string)
+  default     = []
+}
+
 variable "ecs_cluster_names" {
   description = "ECS clusters the Lambda may inspect for service and task context. Empty grants read access to all clusters in the account."
   type        = list(string)
