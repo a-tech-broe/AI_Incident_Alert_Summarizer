@@ -55,7 +55,7 @@ class Alert:
 
     @property
     def is_firing(self) -> bool:
-        return self.status.lower() in ("firing", "alerting", "active")
+        return self.status.lower() in ("firing", "alerting", "active", "alarm")
 
     @property
     def dedupe_key(self) -> str:
@@ -155,8 +155,9 @@ def parse(event: dict[str, Any]) -> tuple[list[Alert], str]:
         if alerts:
             return alerts, source_path
 
-    # A single alert object, or a legacy Grafana payload.
-    single = _from_flat_payload(payload)
+    # CloudWatch alarms first — their `state` object would be mangled by the
+    # generic flat path.
+    single = _from_cloudwatch_alarm(payload) or _from_flat_payload(payload)
     if single is not None:
         return [single], source_path
 
@@ -188,6 +189,48 @@ def _from_grafana_instance(instance: dict[str, Any], group: dict[str, Any]) -> A
         annotations={str(k): str(v) for k, v in annotations.items()},
         values=instance.get("values") or {},
         raw=instance,
+    )
+
+
+def _from_cloudwatch_alarm(payload: dict[str, Any]) -> Alert | None:
+    """Normalize a CloudWatch "Alarm State Change" event.
+
+    Handled separately because its `state` is an object, not a string. Falling
+    through to the generic path stringifies that dict into `status`, which then
+    fails the is_firing check — so every alarm is silently dropped as resolved.
+    """
+    name = payload.get("alarmName") or payload.get("AlarmName")
+    state = payload.get("state")
+    if not name or not isinstance(state, dict):
+        return None
+
+    value = str(state.get("value", "")).upper()
+    configuration = payload.get("configuration") or {}
+
+    # Dimensions carry the affected resource (InstanceId, LoadBalancer,
+    # DBInstanceIdentifier, ...). Lifting them into labels lets the usual
+    # service/cluster lookup find one without special-casing metric shapes.
+    labels: dict[str, str] = {}
+    for metric in configuration.get("metrics") or []:
+        dimensions = ((metric.get("metricStat") or {}).get("metric") or {}).get("dimensions") or {}
+        for key, dim_value in dimensions.items():
+            labels.setdefault(str(key), str(dim_value))
+
+    return Alert(
+        # Only ALARM is actionable. OK is a recovery; INSUFFICIENT_DATA usually
+        # means a metric stopped reporting, which is noisy enough to page on by
+        # default and is better surfaced by its own alarm.
+        name=str(name),
+        status="firing" if value == "ALARM" else "resolved",
+        severity=_first_label(labels, _SEVERITY_LABELS) or "unknown",
+        summary=str(state.get("reason") or ""),
+        description=str(configuration.get("description") or ""),
+        service=_first_label(labels, _SERVICE_LABELS),
+        cluster=_first_label(labels, _CLUSTER_LABELS),
+        starts_at=state.get("timestamp"),
+        fingerprint=str(name),
+        labels=labels,
+        raw=payload,
     )
 
 

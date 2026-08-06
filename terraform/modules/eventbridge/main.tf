@@ -18,12 +18,97 @@ resource "aws_cloudwatch_event_archive" "this" {
 }
 
 locals {
+  # Forwarded CloudWatch alarms keep their original `aws.cloudwatch` source, so
+  # the custom-bus rule has to accept it or the forward lands and matches
+  # nothing. Folding it in here keeps the toggle to a single variable.
+  matched_sources = distinct(concat(
+    var.event_sources,
+    var.forward_cloudwatch_alarms ? ["aws.cloudwatch"] : [],
+  ))
+
   # detail-type is only included when the caller pins specific values; an empty
   # list must not become `"detail-type": []`, which matches nothing.
   event_pattern = merge(
-    { source = var.event_sources },
+    { source = local.matched_sources },
     length(var.event_detail_types) > 0 ? { "detail-type" = var.event_detail_types } : {},
   )
+}
+
+# ---------------------------------------------------------------------------
+# Optional: forward CloudWatch alarm state changes onto the alerts bus.
+#
+# Alarm state changes are emitted by AWS onto the account's DEFAULT bus. They
+# cannot be routed to this stack's rule directly, so a rule on the default bus
+# republishes them here. This is what lets an existing EC2/ALB/RDS workload feed
+# the summarizer without touching application code.
+# ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "forwarder_assume" {
+  count = var.forward_cloudwatch_alarms ? 1 : 0
+
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "forwarder" {
+  count = var.forward_cloudwatch_alarms ? 1 : 0
+
+  name               = "${var.name_prefix}-alarm-forwarder"
+  description        = "Lets EventBridge republish CloudWatch alarm events onto the alerts bus."
+  assume_role_policy = data.aws_iam_policy_document.forwarder_assume[0].json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "forwarder" {
+  count = var.forward_cloudwatch_alarms ? 1 : 0
+
+  name = "put-events"
+  role = aws_iam_role.forwarder[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "events:PutEvents"
+      Resource = aws_cloudwatch_event_bus.this.arn
+    }]
+  })
+}
+
+resource "aws_cloudwatch_event_rule" "cloudwatch_alarms" {
+  count = var.forward_cloudwatch_alarms ? 1 : 0
+
+  name        = "${var.name_prefix}-forward-cloudwatch-alarms"
+  description = "Republishes CloudWatch alarm state changes onto the alerts bus."
+
+  # Deliberately not filtered to ALARM here: the handler decides what is
+  # actionable, and an OK transition is still useful for correlation. Narrow
+  # with alarm_name_prefixes when the account has unrelated alarms.
+  event_pattern = jsonencode(merge(
+    {
+      source        = ["aws.cloudwatch"]
+      "detail-type" = ["CloudWatch Alarm State Change"]
+    },
+    length(var.forwarded_alarm_name_prefixes) > 0
+    ? { detail = { alarmName = [for p in var.forwarded_alarm_name_prefixes : { prefix = p }] } }
+    : {},
+  ))
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_event_target" "cloudwatch_alarms" {
+  count = var.forward_cloudwatch_alarms ? 1 : 0
+
+  rule      = aws_cloudwatch_event_rule.cloudwatch_alarms[0].name
+  target_id = "alerts-bus"
+  arn       = aws_cloudwatch_event_bus.this.arn
+  role_arn  = aws_iam_role.forwarder[0].arn
 }
 
 resource "aws_cloudwatch_event_rule" "this" {

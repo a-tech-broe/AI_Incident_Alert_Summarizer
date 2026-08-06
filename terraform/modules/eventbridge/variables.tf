@@ -75,3 +75,15 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "forward_cloudwatch_alarms" {
+  description = "Republish CloudWatch alarm state changes from the account's default bus onto the alerts bus. Lets an existing workload feed the summarizer without application changes."
+  type        = bool
+  default     = false
+}
+
+variable "forwarded_alarm_name_prefixes" {
+  description = "Only forward alarms whose name starts with one of these. Empty forwards every alarm in the account, which is rarely what you want when other projects share it."
+  type        = list(string)
+  default     = []
+}
