@@ -39,7 +39,13 @@ _MAX_TEXT = 2800
 # Maps the failure to something a responder can act on. Ordered — first match
 # wins, so put the more specific patterns first.
 _FAILURE_REASONS: tuple[tuple[str, str], ...] = (
-    ("Too many tokens", "Bedrock daily token quota is exhausted. It resets on a rolling 24h basis."),
+    # A per-day quota of 0 also surfaces as "too many tokens", so this cannot
+    # promise a reset — zero never resets into anything usable.
+    (
+        "Too many tokens",
+        "Bedrock rejected the request on a token quota. If the per-day quota for this "
+        "model is 0, model access is not enabled — check Bedrock → Model access.",
+    ),
     ("ThrottlingException", "Bedrock is throttling requests. Retry shortly."),
     ("AccessDeniedException", "Bedrock model access is not granted for this account and region."),
     ("ValidationException", "Bedrock rejected the request — check the configured model ID."),

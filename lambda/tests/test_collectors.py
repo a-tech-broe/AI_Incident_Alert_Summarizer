@@ -273,13 +273,13 @@ class TestFallbackMessage:
         body = json.dumps(captured)
         assert "reached max retries" not in body
         assert "InvokeModel" not in body
-        assert "quota is exhausted" in body
+        assert "Model access" in body
 
     def test_known_failures_get_actionable_text(self):
         import slack
 
         cases = {
-            "Too many tokens per day": "quota",
+            "Too many tokens per day": "Model access",
             "(AccessDeniedException) when calling": "model access",
             "(ValidationException) bad model": "model ID",
             "still holds the Terraform placeholder": "credential",
