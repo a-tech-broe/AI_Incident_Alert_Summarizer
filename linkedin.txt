@@ -1,0 +1,60 @@
+I built an AI incident summarizer on AWS. The AI was the easiest part.
+
+One file out of ten. None of the hard decisions.
+
+The rest was the unglamorous work of making it trustworthy when its
+dependencies misbehave — and that's what I wrote up. Eight real failures,
+with the actual error text:
+
+→ An OIDC trust policy correct in every single field, still denied by STS.
+GitHub had quietly assigned the repo an immutable subject claim with numeric
+IDs. Every name-based trust policy breaks and nothing tells you.
+
+→ Every CloudWatch alarm silently dropped. Its `state` is an object, not a
+string — so alarms parsed as "resolved" and vanished before any model call.
+No error. No log line. A component reporting success while doing nothing.
+
+→ `ThrottlingException: Too many tokens per day` that did not mean throttling.
+The account was AUTHORIZED with a quota of zero. I got that diagnosis wrong
+three times before I stopped reading the error and started querying the state.
+
+Three design principles survived contact with reality:
+
+• Enrichment never blocks notification. Six telemetry sources fan out under a
+deadline that reserves 22 seconds for the model.
+
+• Delivery is the last thing to fail. If Bedrock dies, the raw alert still
+reaches Slack. A model outage must not become an alerting outage.
+
+• Unavailable context is stated, not omitted. Drop a failed source silently and
+the model can't tell "ECS was healthy" from "ECS was never queried" — absence
+of evidence becomes evidence of absence.
+
+Also in there: why confidence is high/medium/low and not 85%, why alert
+payloads are untrusted input, and what it actually costs (~$3/month idle,
+~$0.025 per alert).
+
+Link in comments.
+
+#SRE #DevOps #AWS #PlatformEngineering #AIEngineering #Terraform
+
+
+---------------------------------------------------------------------------
+POSTING NOTES (not part of the post)
+---------------------------------------------------------------------------
+
+1. Put the Medium URL in the FIRST COMMENT, not the post body. LinkedIn
+   suppresses reach on posts with outbound links. Then edit the post to say
+   "Link in comments" — which it already does.
+
+2. The first two lines are what shows before "…see more" on mobile. They are
+   built to work alone as a hook. Don't add a preamble above them.
+
+3. Best windows for this audience: Tue–Thu, 8–10am in your target timezone.
+
+4. Reply to every comment in the first 90 minutes. Engagement velocity in that
+   window drives distribution more than anything in the copy.
+
+5. If you want a shorter variant, cut the three bullet principles and keep the
+   three failures — the failures are the part that stops senior engineers
+   scrolling, because they have all lost a day to something like them.

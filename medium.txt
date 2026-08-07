@@ -1,0 +1,367 @@
+# The AI Was the Easy Part
+
+## Building an AI incident summarizer on AWS, and the eight things that actually broke
+
+---
+
+The pitch is easy to say out loud. An alert fires. Before the on-call engineer
+has finished opening a console tab, a message lands in Slack: what's broken, who
+it affects, the likeliest cause, the evidence behind that claim, and what to do
+next.
+
+The pitch is also, in 2026, nearly trivial to prototype. Wire a webhook to a
+Lambda, stuff the alert into a model, post the response. An afternoon's work.
+
+I built the real version — Terraform modules, a CI/CD pipeline with OIDC, six
+telemetry sources, a Bedrock call, Slack delivery. And the model call turned out
+to be the least interesting part of it by a wide margin. One file out of ten,
+and none of the hard decisions.
+
+What consumed the actual engineering was the boring, unglamorous work of making
+the thing trustworthy when its dependencies misbehave. That's the part worth
+writing about, so that's what this is: the design principles that survived
+contact with reality, and the eight failures that produced them.
+
+---
+
+## What it does
+
+A Grafana alert or a CloudWatch alarm arrives, via a Lambda Function URL or an
+EventBridge custom bus. The handler normalizes it — the two ingestion paths carry
+different envelopes, and Grafana groups multiple firing instances into one POST —
+then fans out to six enrichment sources concurrently:
+
+- **ECS** — deployment state, rollout progress, stopped-task reasons
+- **CloudWatch alarms** — what else is firing right now (blast radius)
+- **CloudWatch metrics** — CPU and memory over a lookback window, with a trend
+- **CloudWatch Logs Insights** — error signatures, aggregated rather than raw
+- **Grafana** — the rule definition, sibling alerts, active silences
+- **Splunk** — correlated log patterns from outside AWS
+
+That context goes to Amazon Bedrock, which returns a structured JSON summary. The
+summary is rendered as Slack Block Kit and posted.
+
+Infrastructure is eight Terraform modules. Delivery is GitHub Actions with OIDC:
+fmt → validate → plan → approval → apply → package → upload → update, with a
+smoke test before the alias moves.
+
+Now the interesting part.
+
+---
+
+## Three principles that shaped everything
+
+### Enrichment never blocks notification
+
+Six enrichment sources means six things that can hang. A Splunk search against a
+loaded indexer can take thirty seconds. A Logs Insights query can take longer.
+
+So every collector returns a status dictionary instead of raising, and the whole
+gather stage runs under a deadline that reserves 22 seconds for the model call.
+Collectors check the remaining budget before starting expensive work and decline
+if there isn't enough:
+
+```
+if deadline.remaining_seconds() < 10:
+    return {"available": False, "reason": "Skipped: insufficient time"}
+```
+
+A degraded Splunk costs you detail. It must never cost you the page.
+
+### Delivery is the last thing to fail
+
+If Bedrock errors, throttles, or returns something the parser can't read, the raw
+alert still reaches Slack — with a banner explaining that summarization was
+unavailable.
+
+This sounds obvious. It is not what most implementations do. The default shape of
+"call the model, post the result" means a model outage becomes an alerting
+outage, which is strictly worse than having no summarizer at all. The failure
+mode of an incident-response tool must be *less useful*, never *silent*.
+
+### Unavailable context is stated, not omitted
+
+This one is specific to building on top of a language model, and it's the design
+decision I'd defend hardest.
+
+When a collector fails, the prompt says so explicitly:
+
+```
+<splunk status="unavailable">Splunk unreachable</splunk>
+```
+
+The obvious implementation drops the failed source and sends what it has. But
+then the model cannot distinguish "ECS reported the service healthy" from "ECS
+was never queried." Absence of evidence reads as evidence of absence, and the
+summary quietly overstates its own completeness — presenting a partial picture
+with the confidence of a complete one.
+
+The response schema has a `context_gaps` field for the same reason. A summary
+that says "I couldn't reach your logs" is more useful than one that pretends it
+didn't need them.
+
+---
+
+## Eight things that actually broke
+
+### 1. A trust policy that was correct and still denied
+
+GitHub Actions couldn't assume its deploy role. `Not authorized to perform
+sts:AssumeRoleWithWebIdentity`.
+
+I verified the OIDC provider URL, the client ID list, the thumbprints, the
+`Principal.Federated` ARN, the `sts:AssumeRoleWithWebIdentity` action, the `aud`
+condition, and the `sub` allowlist. Every single one correct. I assumed STS
+propagation lag after a role recreation and retried. Identical failure.
+
+The answer was a repository setting I hadn't thought to look at:
+
+```
+gh api repos/OWNER/REPO/actions/oidc/customization/sub
+{"sub_claim_prefix": "repo:owner@279850212/AI_SRE@1323167825"}
+```
+
+GitHub had assigned the repo an **immutable subject prefix**. The token presents
+`repo:owner@279850212/AI_SRE@1323167825:environment:plan`, with numeric IDs. The
+trust policy allowed `repo:owner/AI_SRE:environment:plan`. No match.
+
+The IDs exist so a renamed or re-created repo can't inherit trust granted to its
+old name. Sensible — and it silently breaks every name-based trust policy. The
+module now emits both forms, wildcarding the IDs since they aren't knowable at
+plan time.
+
+The lesson isn't about OIDC. It's that when every component checks out and the
+system still fails, the wrong variable is one you haven't observed — not one
+you've observed and misjudged. I burned a lot of time re-verifying things I'd
+already confirmed.
+
+### 2. A first apply that could never have worked
+
+The Lambda needs a deployment package in S3 before it can be created, but the
+pipeline uploads the real package *after* apply. So Terraform seeds a placeholder
+zip via `archive_file`.
+
+That works locally, where plan and apply share a directory. In CI they're
+different runners. The apply job downloads the saved plan — but not the generated
+zip:
+
+```
+Error: opening S3 object source (.terraform-bootstrap.zip): no such file
+```
+
+Two fixes. Ship the zip with the plan artifact (with `include-hidden-files: true`
+— the filename starts with a dot, and `upload-artifact@v4` silently skips hidden
+files). And `ignore_changes = all` on the seed object, because the deploy
+workflow's `aws s3 cp` replaces it wholesale, dropping provider-applied tags, so
+Terraform planned a *modify* — and modifying an S3 object means re-uploading from
+a source file that runner never had.
+
+My original `ignore_changes = [etag, source, source_hash]` was a field list. Field
+lists only cover the fields you thought of.
+
+### 3. A concurrency reservation that couldn't exist
+
+```
+InvalidParameterValueException: Specified ReservedConcurrentExecutions
+decreases account's UnreservedConcurrentExecution below its minimum value of [10]
+```
+
+A new AWS account has a *total* Lambda concurrency quota of 10, and AWS enforces
+a floor of 10 unreserved. Any reservation is rejected — not just my 10; even 1.
+
+I'd set the reservation deliberately, to bound model spend during an alert storm.
+Removing it felt like losing a guardrail until the arithmetic landed: an account
+capped at 10 concurrent executions already bounds spend harder than my
+reservation would have. The control was redundant with a constraint I hadn't
+noticed.
+
+The apply also left the function **tainted** — created, but the follow-up call
+failed. The next plan showed `delete/create`. The tell that it's a taint rather
+than a config-driven replacement: `replace_paths: null` with every `after` value
+nulled. `terraform untaint` avoided a pointless rebuild.
+
+### 4. Every CloudWatch alarm silently dropped
+
+Before recommending CloudWatch alarms as an ingestion path, I tested the parser
+against a real event. Good thing:
+
+```
+name      : banking-platform-api-5xx
+is_firing : False   <-- the alert is dropped
+```
+
+The name parsed fine. But CloudWatch's `state` is an object, not a string:
+
+```json
+"state": {"value": "ALARM", "reason": "Threshold Crossed: ..."}
+```
+
+The generic path stringified it, the result didn't match any known firing status,
+and the alarm was classified as resolved and discarded before any model call. No
+error. No log line. A silent, total failure of that ingestion path.
+
+This is the failure mode I find most worth guarding against: not a crash, but a
+component that reports success while doing nothing. It only surfaced because I
+tested the payload shape instead of trusting that "CloudWatch alarms are handled."
+
+### 5. A credential written to the logs
+
+A Slack post failed. The handler logged the error. I'd been careful — the URL was
+redacted in my own message:
+
+```python
+raise HttpError(f"{method} {_redact(url)} failed: {exc}")
+```
+
+But `exc` is urllib3's exception, and urllib3 embeds the full URL in
+`Max retries exceeded with url: ...`. For a Slack incoming webhook, the path *is*
+the credential. It went to CloudWatch Logs in plaintext.
+
+Redaction that only covers the string you wrote yourself isn't redaction. The
+scrubber now regex-redacts URLs anywhere in the message, plus removes the known
+request path by literal substring — because my regex-only first attempt failed
+its own test on a space-corrupted URL, which was the exact shape that caused the
+original failure.
+
+(The trigger, incidentally, was a leading space in a pasted webhook. `get_secret`
+now strips whitespace. A space that survives JSON encoding invisibly and produces
+`InvalidURL: URL can't contain control characters` is a bad way to spend an
+afternoon.)
+
+### 6. A metric query that lied
+
+Diagnosing whether an EventBridge rule had fired:
+
+```bash
+--dimensions Name=RuleName,Value=my-rule
+# TriggeredRules: no datapoints
+```
+
+I reported that the rule never matched. Wrong. Custom-bus rules need **both**
+`RuleName` and `EventBusName`. With both:
+
+```
+TriggeredRules: 1.0   Invocations: 1.0   FailedInvocations: 0
+```
+
+It had been working the entire time. A single-dimension query returns nothing
+rather than erroring, and "no datapoints" is indistinguishable from "never
+happened." I'd published a diagnosis off a query that couldn't have produced a
+different answer.
+
+### 7. Authorization is not capacity
+
+Every Bedrock invocation failed:
+
+```
+ThrottlingException: Too many tokens per day, please wait before trying again.
+```
+
+That reads unambiguously: a limit you consumed, wait for the reset. So that is
+what I concluded. Then, later, that it must be missing model access. Both wrong.
+
+```
+authorizationStatus     : AUTHORIZED
+entitlementAvailability : AVAILABLE
+
+Model invocation max tokens per day ... : 0.0   (Adjustable: False)
+```
+
+Bedrock grants **authorization** and **throughput** independently. The account was
+fully authorized with a quota of zero, so the first token exceeded it. Zero never
+resets into anything usable, and re-granting model access changes nothing. Other
+vendors had live quotas in the same account — so not a blanket block, but
+Anthropic-specific capacity that needs a Support case.
+
+Three wrong diagnoses in a row, all from pattern-matching an error string instead
+of querying the two states that actually determine the outcome. The error message
+was actively misleading, which is a reason to verify rather than an excuse not
+to.
+
+### 8. A message that was technically correct and practically useless
+
+The degraded-path Slack message dumped the raw boto exception:
+
+> `An error occurred (ThrottlingException) when calling the InvokeModel operation
+> (reached max retries: 3): Too many tokens per day...`
+
+Longer than the alert it was attached to, actionable to nobody, and an
+uncontrolled exception string posted into a chat channel — the same class of
+mistake as the log leak.
+
+Now: the alert's own text leads, then severity and service, then one sentence in
+small type explaining what failed and what to do. The full error stays in
+CloudWatch Logs where it belongs.
+
+I only noticed because I saw the message rendered in Slack. It looked fine in the
+logs.
+
+---
+
+## The AI-specific decisions
+
+Three, and they're all about calibrating trust rather than improving output.
+
+**Confidence is high/medium/low, not 85%.** The original spec called for a
+percentage. A language model's self-reported percentage isn't calibrated, and a
+precise-looking number invites more trust than it has earned. Three buckets are
+honest about the resolution actually available.
+
+**The prompt forbids inventing causes.** A confidently wrong root cause is worse
+than no summary — it sends the responder down a dead end while the outage
+continues. The system prompt separates observation from inference, requires
+hedging on inference, and asks for a well-scoped "unknown" over a guess.
+
+**Alert payloads are untrusted input.** A pod name, a log line, a Grafana
+annotation — all attacker-influenceable in the general case. Telemetry is fenced
+in XML tags and never interpolated into instructions. Service labels are stripped
+of SPL metacharacters before reaching a Splunk search, because an unfiltered pipe
+would append arbitrary commands to it. An optional Bedrock guardrail backstops
+both.
+
+---
+
+## What it costs
+
+About **$3/month idle**, dominated by Secrets Manager at $0.40 per secret.
+About **$0.025 per alert**, of which Bedrock is ~97%. At 1,000 alerts/month,
+roughly $28.
+
+Two things bound the worst case: resolved alerts are dropped before any model
+call, and reserved concurrency caps parallel invocations during a storm. The most
+likely way to overspend isn't volume — it's a flapping alert rule, which no alarm
+in the system catches because the invocations are all *succeeding*.
+
+Prompt caching doesn't help, incidentally: the system prompt is ~600 tokens,
+under the 1,024-token minimum cacheable prefix. It silently never caches. Padding
+the prompt to cross that line would cost more than it saves.
+
+---
+
+## What I'd tell someone starting this
+
+**The model is a component, not the architecture.** Every meaningful decision was
+about what happens when it's unavailable, slow, wrong, or being fed hostile input.
+If your design gets interesting only when the model behaves, you've designed the
+happy path.
+
+**Verify the state, don't infer it from the error.** Three of the eight failures
+above cost real time because I read an error message and pattern-matched instead
+of querying the system. `ThrottlingException` did not mean throttling. "No
+datapoints" did not mean it never fired. The errors were misleading, which is
+precisely when checking matters most.
+
+**Silent success is the expensive failure.** The dropped CloudWatch alarms, the
+never-written prompt cache, the skipped hidden file in the artifact upload — none
+raised an error. Test the shape of your inputs, not just the shape of your code.
+
+**Look at the output where the user sees it.** The Slack message was correct in
+the logs and unusable in the channel. That's not a bug any test would catch.
+
+The current state: 92 tests, eight Terraform modules, a CI/CD pipeline verified
+end to end, and every stage from ingestion through delivery working in a real AWS
+account — with one outstanding blocker that is a Bedrock capacity grant on AWS's
+side rather than anything in the code.
+
+Which is its own small lesson. The last thing standing between a working system
+and a useful one is often not engineering at all.
