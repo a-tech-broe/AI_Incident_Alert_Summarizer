@@ -20,6 +20,22 @@ AWS event sources ──►  EventBridge rule  ───┘            │
                                                          └─► Bedrock     (summary generation)
 ```
 
+### Ingestion paths
+
+Transport and payload shape are detected independently, so any producer can
+reach it by whichever route it already has:
+
+| Arrives via | Recognized shape |
+| --- | --- |
+| Function URL (`X-Webhook-Token`) | Grafana unified alerting group — `alerts[]` |
+| EventBridge `PutEvents` on the alerts bus | CloudWatch alarm state change — object `state` |
+| Direct invocation (console test, manual replay) | Flat `{alertname, severity, service, ...}` |
+
+CloudWatch alarms need no application changes: set `forward_cloudwatch_alarms`
+and the stack republishes matching alarms from the default bus onto its own.
+`OK` and `INSUFFICIENT_DATA` are dropped before any model call. Wiring an
+existing workload in either way: [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md).
+
 ---
 
 ## What it produces
@@ -65,7 +81,9 @@ terraform/
 ├── variables.tf       Every input, with validation
 ├── outputs.tf         Values the pipeline and operators consume
 ├── terraform.tfvars   Non-secret defaults
-└── backend.tf         Partial S3 backend config
+├── providers.tf       Provider and default tag configuration
+├── versions.tf        Terraform and provider version constraints
+└── backend.tf         S3 backend config (bucket and lock table are literals)
 
 lambda/
 ├── app.py             Handler: auth, routing, orchestration, failure handling
@@ -78,6 +96,8 @@ lambda/
 ├── prompt.py          Prompt construction and Bedrock invocation
 ├── slack.py           Block Kit formatting and delivery
 ├── http_client.py     Shared HTTP with per-purpose retry budgets
+├── requirements.txt   Runtime dependencies (what gets packaged)
+├── requirements-dev.txt  Test and lint tooling
 └── tests/             92 tests, no AWS calls required
 
 .github/workflows/
@@ -87,12 +107,15 @@ lambda/
 
 scripts/
 └── smoke-test.sh      End-to-end probe: EventBridge → Lambda → Slack
+                       --resolved (no model call), --cloudwatch (alarm shape),
+                       --no-cold-start
 
 docs/
 ├── BOOTSTRAP.md       First deployment into a fresh account
 ├── INTEGRATIONS.md    Feeding it from an existing workload
 ├── RUNBOOK.md         Operating and troubleshooting
-└── SPEC.md            The original brief
+├── SPEC.md            The original brief
+└── bootstrap-iam-policy.json  Permissions the first apply needs
 ```
 
 ---
@@ -151,8 +174,8 @@ terraform -chdir=terraform apply
 ```
 
 Edit `terraform/terraform.tfvars` first if you want Grafana/Splunk enrichment,
-ECS cluster scoping, or the OIDC deployment role — all are off by default so the
-stack applies cleanly on an empty account.
+ECS cluster scoping, CloudWatch alarm forwarding, or the OIDC deployment role —
+all are off by default so the stack applies cleanly on an empty account.
 
 ### 2. Populate the secrets
 
@@ -218,8 +241,23 @@ approval.
 make install      # dev dependencies
 make check        # everything CI runs: validate, lint, test
 make test         # pytest only
+make lint         # ruff check + format check
+make coverage     # tests with a term-missing coverage report
 make package      # build the arm64 deployment package locally
+make help         # every target
 ```
+
+The tests stub every AWS and SaaS call, so the suite runs without credentials.
+To exercise a deployed stack instead:
+
+```bash
+scripts/smoke-test.sh --resolved    # parse and route only, no Bedrock spend
+scripts/smoke-test.sh               # full path, ends in a real Slack message
+scripts/smoke-test.sh --cloudwatch  # alarm-shaped payload rather than Grafana
+```
+
+It publishes one synthetic alert to the bus and reports what each stage did by
+reading the structured log events back.
 
 ---
 
@@ -315,7 +353,7 @@ Three things worth knowing:
 
 Measure rather than trust the estimate: every summary logs its real token counts.
 
-```
+```text
 fields @timestamp, input_tokens, output_tokens
 | filter event = "bedrock_invoke_succeeded"
 | stats sum(input_tokens) as in, sum(output_tokens) as out, count(*) as calls by bin(1d)
