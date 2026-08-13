@@ -66,7 +66,14 @@ state_lock_table = "family_dyning"
 # --- CI/CD ----------------------------------------------------------------
 # Set to your repository to create the OIDC deployment role, then publish the
 # resulting github_actions_role_arn output as the AWS_ROLE_ARN repo variable.
-github_repository      = "a-tech-broe/AI_SRE"
+#
+# This must be the repository's CURRENT owner/name, not the project's name — the
+# OIDC subject GitHub presents is built from it. A stale value here fails every
+# run at AssumeRoleWithWebIdentity with "Not authorized", and cannot be repaired
+# by the pipeline: the workflows pass the right value to plan, but the step that
+# would apply the fix is the step that cannot authenticate. Fix it with a local
+# apply. (The original brief called this project AI_SRE; the repo never was.)
+github_repository      = "a-tech-broe/AI_Incident_Alert_Summarizer"
 github_deploy_branches = ["main"]
 
 # Both workflow environments must be listed: a job declaring `environment:` gets
