@@ -8,10 +8,26 @@ failure still produces a page.
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import app
 from config import SecretNotConfigured
+
+
+def _group(*services: str, name: str = "HighErrorRate") -> dict:
+    """A firing group with one instance per named service."""
+    return {
+        "alerts": [
+            {
+                "status": "firing",
+                "labels": {"alertname": f"{name}-{i}", "service": service, "cluster": "prod"},
+                "fingerprint": f"fp{i}",
+            }
+            for i, service in enumerate(services)
+        ]
+    }
 
 
 class FakeContext:
@@ -165,6 +181,152 @@ class TestFailureHandling:
         assert response["statusCode"] == 200
         assert body["delivered"] == 0
         assert body["processed"] == 1
+
+
+class TestAlertGroups:
+    """A Grafana group carries one entry per firing instance.
+
+    Processed serially these overrun the timeout, and a killed invocation is not
+    a return value — it bypasses the 200-with-a-failure-count contract and lets
+    EventBridge retry the batch, re-posting summaries that already landed.
+    """
+
+    def test_alerts_in_a_group_are_summarized_concurrently(self):
+        # A barrier is the assertion: three threads can only all arrive if the
+        # alerts genuinely overlap. Serial execution deadlocks it, and the
+        # timeout fails the test rather than hanging the suite.
+        barrier = threading.Barrier(3, timeout=5)
+
+        def summarize(*_args, **_kwargs):
+            barrier.wait()
+            return {"confidence": "high"}
+
+        with (
+            patch("app._gather_context", return_value={}),
+            patch("app.prompt.summarize", side_effect=summarize),
+            patch("app.slack.post_summary", return_value=True),
+        ):
+            response = app.lambda_handler(_group("a", "b", "c"), FakeContext())
+
+        assert _body(response)["processed"] == 3
+        assert _body(response)["delivered"] == 3
+
+    def test_results_follow_the_order_the_producer_sent(self):
+        with (
+            patch("app._gather_context", return_value={}),
+            patch("app.prompt.summarize", return_value={"confidence": "high"}),
+            patch("app.slack.post_summary", return_value=True),
+        ):
+            response = app.lambda_handler(_group("a", "b", "c"), FakeContext())
+
+        names = [r["alert"] for r in _body(response)["results"]]
+        assert names == ["HighErrorRate-0", "HighErrorRate-1", "HighErrorRate-2"]
+
+    def test_one_alert_failing_unexpectedly_does_not_sink_the_group(self):
+        # Raised from delivery, which sits outside _process_alert's own try —
+        # so only the group-level backstop can keep the other two alerts.
+        def post_summary(alert, _summary, _context):
+            if alert["name"] == "HighErrorRate-1":
+                raise OSError("connection reset by peer")
+            return True
+
+        with (
+            patch("app._gather_context", return_value={}),
+            patch("app.prompt.summarize", return_value={"confidence": "high"}),
+            patch("app.slack.post_summary", side_effect=post_summary),
+        ):
+            response = app.lambda_handler(_group("a", "b", "c"), FakeContext())
+
+        body = _body(response)
+        assert response["statusCode"] == 200
+        assert body["processed"] == 3
+        assert body["delivered"] == 2
+
+
+class TestSharedEnrichment:
+    """Alerts in a group share commonLabels, so their collectors would otherwise
+    re-issue identical calls — including the Insights query, the slowest and the
+    only one billed per scan."""
+
+    def _run(self, event):
+        """Run a group with every collector stubbed, recording log lookups.
+
+        Returns the service argument of each `collect_logs` call — the Insights
+        query is the collector worth counting.
+        """
+        calls: list[str] = []
+
+        def collect_logs(service, _deadline):
+            calls.append(service)
+            return {"available": True}
+
+        stubs = {
+            "app.ecs.collect": {"available": False},
+            "app.cloudwatch.collect_alarms": {"available": False},
+            "app.cloudwatch.collect_metrics": {"available": False},
+            "app.grafana.collect": {"available": False},
+            "app.splunk.collect": {"available": False},
+        }
+
+        with ExitStack() as stack:
+            for target, value in stubs.items():
+                stack.enter_context(patch(target, return_value=value))
+            stack.enter_context(patch("app.cloudwatch.collect_logs", collect_logs))
+            stack.enter_context(patch("app.prompt.summarize", return_value={"confidence": "high"}))
+            stack.enter_context(patch("app.slack.post_summary", return_value=True))
+
+            app.lambda_handler(event, FakeContext())
+
+        return calls
+
+    def test_identical_lookups_run_once_for_the_whole_group(self):
+        assert self._run(_group("checkout", "checkout", "checkout")) == ["checkout"]
+
+    def test_different_services_still_get_their_own_lookups(self):
+        assert sorted(self._run(_group("checkout", "payments"))) == ["checkout", "payments"]
+
+
+class TestGenerationBudget:
+    def test_an_alert_with_no_time_left_is_delivered_raw(self):
+        """Starting a generation that cannot finish spends the model call and
+        still loses the alert. The raw page is worth more."""
+        event = {"alerts": [{"status": "firing", "labels": {"alertname": "X"}}]}
+
+        with (
+            patch("app.prompt.summarize") as summarize,
+            patch("app.slack.post_fallback", return_value=True) as fallback,
+        ):
+            # Under _ALERT_BUDGET_SECONDS: too little for generation + delivery.
+            response = app.lambda_handler(event, FakeContext(remaining_ms=10_000))
+
+        summarize.assert_not_called()
+        fallback.assert_called_once()
+        assert _body(response)["results"][0]["delivered"] is True
+
+    def test_enrichment_is_skipped_too_when_the_budget_is_gone(self):
+        """The check sits ahead of the gather stage, so a doomed alert does not
+        pay for context it will never summarize."""
+        event = {"alerts": [{"status": "firing", "labels": {"alertname": "X"}}]}
+
+        with (
+            patch("app._gather_context") as gather,
+            patch("app.slack.post_fallback", return_value=True),
+        ):
+            app.lambda_handler(event, FakeContext(remaining_ms=10_000))
+
+        gather.assert_not_called()
+
+    def test_a_normal_budget_still_summarizes(self):
+        event = {"alerts": [{"status": "firing", "labels": {"alertname": "X"}}]}
+
+        with (
+            patch("app._gather_context", return_value={}),
+            patch("app.prompt.summarize", return_value={"confidence": "high"}) as summarize,
+            patch("app.slack.post_summary", return_value=True),
+        ):
+            app.lambda_handler(event, FakeContext(remaining_ms=60_000))
+
+        summarize.assert_called_once()
 
 
 class TestSafeCollect:

@@ -236,13 +236,26 @@ class Deadline:
         self._reserve = reserve_seconds
         self._started = time.monotonic()
 
+    def total_remaining_seconds(self) -> float:
+        """Seconds left before the Lambda is killed, reserve included."""
+        if self._context is not None and hasattr(self._context, "get_remaining_time_in_millis"):
+            return max(0.0, self._context.get_remaining_time_in_millis() / 1000.0)
+        return max(0.0, 60.0 - (time.monotonic() - self._started))
+
     def remaining_seconds(self) -> float:
         """Seconds left for enrichment, holding back the Bedrock reserve."""
-        if self._context is not None and hasattr(self._context, "get_remaining_time_in_millis"):
-            total = self._context.get_remaining_time_in_millis() / 1000.0
-        else:
-            total = 60.0 - (time.monotonic() - self._started)
-        return max(0.0, total - self._reserve)
+        return max(0.0, self.total_remaining_seconds() - self._reserve)
 
     def expired(self) -> bool:
         return self.remaining_seconds() <= 0
+
+    def allows(self, needed_seconds: float) -> bool:
+        """Whether a step needing `needed_seconds` can still finish in time.
+
+        Checked against the *whole* remaining budget rather than the enrichment
+        share, because the caller asking is the step the reserve exists for.
+        Generation is the one thing that cannot be degraded — started too late it
+        is killed mid-flight, taking the whole invocation with it — so it is
+        gated up front instead of attempted hopefully.
+        """
+        return self.total_remaining_seconds() >= needed_seconds

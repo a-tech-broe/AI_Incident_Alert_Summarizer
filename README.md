@@ -98,7 +98,7 @@ lambda/
 ├── http_client.py     Shared HTTP with per-purpose retry budgets
 ├── requirements.txt   Runtime dependencies (what gets packaged)
 ├── requirements-dev.txt  Test and lint tooling
-└── tests/             92 tests, no AWS calls required
+└── tests/             100 tests, no AWS calls required
 
 .github/workflows/
 ├── ci.yml             fmt, validate, tflint, checkov, ruff, pytest
@@ -129,6 +129,24 @@ reserves 22 seconds for Bedrock. A degraded Splunk costs detail, not the page.
 **Delivery is the last thing to fail.** If Bedrock errors or returns unparseable
 output, the raw alert still reaches Slack via `post_fallback`. The failure mode
 of an incident-response tool must be "less useful", never "silent".
+
+**A group's alerts are summarized concurrently, under a per-alert budget.** One
+Grafana group carries an entry per firing instance, each needing its own
+enrichment and its own Bedrock call. Serially, the second alert starts with the
+first one's time already spent and the third is killed mid-generation — and a
+killed invocation is not a return value, so it escapes the "200 with a failure
+count" contract and EventBridge retries the whole batch, re-posting summaries
+that already landed. Concurrency turns the sum of those costs into the maximum;
+alerts that still do not fit are checked *before* enrichment and delivered raw,
+since a generation that cannot finish spends the model call and loses the alert
+anyway. The bound is 3 — every worker holds an in-flight Bedrock call, and
+model throughput is scarcer than Lambda concurrency.
+
+**Collectors are memoized per invocation.** Alerts in a group share
+`commonLabels`, so they routinely carry the same service and cluster. Keyed on
+the arguments, so alerts on different services still get their own lookups —
+what this removes is the repeated Logs Insights query, the slowest step in the
+pipeline and the only one billed per scan.
 
 **Unavailable context is stated, not omitted.** The prompt lists sources that
 could not be reached, so the model can distinguish "ECS reported healthy" from

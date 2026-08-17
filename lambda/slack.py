@@ -57,6 +57,12 @@ _FAILURE_REASONS: tuple[tuple[str, str], ...] = (
     ("ServiceUnavailable", "Bedrock is temporarily unavailable."),
     ("still holds the Terraform placeholder", "A required credential has not been configured."),
     ("no JSON object", "The model returned output the parser could not read."),
+    # Not a fault: the group held more alerts than one invocation could summarize,
+    # so this one was delivered raw rather than started and killed mid-generation.
+    (
+        "invocation deadline",
+        "No time left to summarize this alert — it arrived in a large group. The alert itself is unaffected.",
+    ),
 )
 
 

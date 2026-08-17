@@ -83,16 +83,28 @@ def model_summary() -> dict:
 
 
 class FakeDeadline:
-    """Deadline stand-in with a fixed remaining budget."""
+    """Deadline stand-in with a fixed remaining budget.
 
-    def __init__(self, seconds: float = 30.0) -> None:
+    `remaining_seconds` is the enrichment share; `total_remaining_seconds`
+    adds back the reserve the real Deadline holds for generation, so a fixture
+    built for the collectors still answers `allows()` sensibly.
+    """
+
+    def __init__(self, seconds: float = 30.0, reserve: float = 22.0) -> None:
         self._seconds = seconds
+        self._reserve = reserve
 
     def remaining_seconds(self) -> float:
         return self._seconds
 
+    def total_remaining_seconds(self) -> float:
+        return self._seconds + self._reserve
+
     def expired(self) -> bool:
         return self._seconds <= 0
+
+    def allows(self, needed_seconds: float) -> bool:
+        return self.total_remaining_seconds() >= needed_seconds
 
 
 @pytest.fixture
