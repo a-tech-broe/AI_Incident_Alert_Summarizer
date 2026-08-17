@@ -20,8 +20,11 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any
 
 import alert as alert_parser
@@ -36,6 +39,21 @@ from config import Deadline, SecretNotConfigured, get_config, get_secret, log_ev
 # Bedrock generation is the one step that cannot be skipped or degraded, so it
 # gets a fixed slice of the timeout that enrichment may not encroach on.
 _BEDROCK_RESERVE_SECONDS = 22.0
+
+# Slack delivery after generation. Small, but it is the step that turns a
+# successful summary into a delivered one, so it is budgeted rather than assumed.
+_DELIVERY_RESERVE_SECONDS = 5.0
+
+# An alert is only worth starting if generation *and* delivery still fit.
+_ALERT_BUDGET_SECONDS = _BEDROCK_RESERVE_SECONDS + _DELIVERY_RESERVE_SECONDS
+
+# A group's alerts are summarized concurrently: each needs its own Bedrock call,
+# and serially they cannot fit in the timeout. Bounded rather than unbounded —
+# every worker holds an in-flight Bedrock call, and this account's model
+# throughput is the scarcer resource. Raise it only alongside the quota.
+_MAX_CONCURRENT_ALERTS = 3
+
+_DEADLINE_SKIP_ERROR = "invocation deadline reached before summarization"
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -89,7 +107,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return _response(200, {"processed": 0, "skipped_resolved": resolved})
 
     deadline = Deadline(context, reserve_seconds=_BEDROCK_RESERVE_SECONDS)
-    results = [_process_alert(a, deadline) for a in firing]
+    results = _process_alerts(firing, deadline)
 
     duration_ms = round((time.monotonic() - started) * 1000)
     delivered = sum(1 for r in results if r["delivered"])
@@ -124,7 +142,57 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _process_alert(alert: alert_parser.Alert, deadline: Deadline) -> dict[str, Any]:
+def _process_alerts(firing: list[alert_parser.Alert], deadline: Deadline) -> list[dict[str, Any]]:
+    """Summarize every firing alert in the group, concurrently and in order.
+
+    A Grafana group carries one entry per firing instance, and each entry needs
+    its own enrichment and its own Bedrock call. Run serially, the second alert
+    starts with the first one's time already spent and the third is killed
+    mid-generation — and a killed invocation is not a return value, so it
+    bypasses the "200 with a failure count" contract below and EventBridge
+    retries the whole batch, re-posting summaries that already reached Slack.
+
+    Concurrency turns the sum of those costs into the maximum of them. The
+    per-alert budget check in `_process_alert` covers what still does not fit.
+    """
+    cache = _ContextCache()
+
+    if len(firing) == 1:
+        return [_process_alert_safely(firing[0], deadline, cache)]
+
+    workers = min(len(firing), _MAX_CONCURRENT_ALERTS)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_process_alert_safely, a, deadline, cache) for a in firing]
+        # Indexed rather than as-completed: the response should list alerts in
+        # the order the producer sent them, not the order they finished.
+        return [future.result() for future in futures]
+
+
+def _process_alert_safely(
+    alert: alert_parser.Alert, deadline: Deadline, cache: _ContextCache
+) -> dict[str, Any]:
+    """Backstop so one alert's unexpected failure cannot lose the whole group.
+
+    `_process_alert` handles the failures it knows about. Anything escaping it
+    would propagate out of `future.result()` and fail the invocation, which is
+    the retry-and-duplicate path this whole function exists to avoid.
+    """
+    try:
+        return _process_alert(alert, deadline, cache)
+    except Exception as exc:  # noqa: BLE001 - one alert must not sink the batch
+        log_event(
+            logging.ERROR,
+            "alert_processing_failed",
+            "Alert processing raised an unexpected exception",
+            alert_name=alert.name,
+            error=str(exc),
+        )
+        return {"alert": alert.name, "summarized": False, "delivered": False, "error": str(exc)}
+
+
+def _process_alert(
+    alert: alert_parser.Alert, deadline: Deadline, cache: _ContextCache | None = None
+) -> dict[str, Any]:
     alert_dict = alert.to_dict()
 
     log_event(
@@ -137,7 +205,25 @@ def _process_alert(alert: alert_parser.Alert, deadline: Deadline) -> dict[str, A
         dedupe_key=alert.dedupe_key,
     )
 
-    context = _gather_context(alert, deadline)
+    # Checked before enrichment, not after: starting a generation that cannot
+    # finish spends the model call and still loses the alert. The raw page is
+    # worth more than a summary that arrives as a timeout.
+    if not deadline.allows(_ALERT_BUDGET_SECONDS):
+        log_event(
+            logging.WARNING,
+            "summarization_skipped",
+            "Too little time left to summarize; delivering the raw alert",
+            alert_name=alert.name,
+            remaining_seconds=round(deadline.total_remaining_seconds(), 1),
+        )
+        return {
+            "alert": alert.name,
+            "summarized": False,
+            "delivered": slack.post_fallback(alert_dict, _DEADLINE_SKIP_ERROR),
+            "error": _DEADLINE_SKIP_ERROR,
+        }
+
+    context = _gather_context(alert, deadline, cache)
 
     try:
         summary = prompt.summarize(alert_dict, context)
@@ -171,7 +257,47 @@ def _process_alert(alert: alert_parser.Alert, deadline: Deadline) -> dict[str, A
     }
 
 
-def _gather_context(alert: alert_parser.Alert, deadline: Deadline) -> dict[str, Any]:
+class _ContextCache:
+    """Memoizes collector results for the life of one invocation.
+
+    Alerts in one Grafana group share `commonLabels`, so they routinely carry
+    the same service and cluster. Without this, six collectors re-run per alert
+    with identical arguments — the same `describe_alarms`, the same metric
+    fetch, and the same Logs Insights query, which is both the slowest step in
+    the pipeline and the one that bills per scan.
+
+    Keyed on the arguments rather than the collector name alone, so alerts on
+    different services still each get their own lookups.
+    """
+
+    def __init__(self) -> None:
+        self._results: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._locks: dict[tuple[Any, ...], threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def get(self, key: tuple[Any, ...], compute: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        with self._guard:
+            if key in self._results:
+                return self._results[key]
+            lock = self._locks.setdefault(key, threading.Lock())
+
+        # Held across the call so concurrent alerts wait for the first result
+        # instead of racing to duplicate the work this class exists to avoid.
+        with lock:
+            with self._guard:
+                if key in self._results:
+                    return self._results[key]
+
+            result = compute()
+
+            with self._guard:
+                self._results[key] = result
+            return result
+
+
+def _gather_context(
+    alert: alert_parser.Alert, deadline: Deadline, cache: _ContextCache | None = None
+) -> dict[str, Any]:
     """Run every collector concurrently.
 
     These are all I/O-bound API calls, so threads are the right tool — and
@@ -179,20 +305,50 @@ def _gather_context(alert: alert_parser.Alert, deadline: Deadline) -> dict[str, 
     Each collector handles its own errors; the wrapper below is a backstop for
     anything that escapes, so one unexpected exception cannot lose the other
     four sources' results.
+
+    `cache` is shared across the alerts of one group; omitted, each call gets a
+    private one and behaves exactly as an uncached gather.
     """
-    collectors = {
-        "ecs_service": lambda: ecs.collect(alert.service, alert.cluster, deadline),
-        "cloudwatch_alarms": lambda: cloudwatch.collect_alarms(alert.name, alert.service, deadline),
-        "cloudwatch_metrics": lambda: cloudwatch.collect_metrics(alert.cluster, alert.service, deadline),
-        "cloudwatch_logs": lambda: cloudwatch.collect_logs(alert.service, deadline),
-        "grafana": lambda: grafana.collect(alert.name, deadline),
-        "splunk": lambda: splunk.collect(alert.service, deadline),
+    cache = _ContextCache() if cache is None else cache
+
+    # (cache key, collector). The key names every argument the collector reads,
+    # so two alerts share a result only when the call would have been identical.
+    collectors: dict[str, tuple[tuple[Any, ...], Callable[[], dict[str, Any]]]] = {
+        "ecs_service": (
+            ("ecs_service", alert.service, alert.cluster),
+            lambda: ecs.collect(alert.service, alert.cluster, deadline),
+        ),
+        "cloudwatch_alarms": (
+            ("cloudwatch_alarms", alert.name, alert.service),
+            lambda: cloudwatch.collect_alarms(alert.name, alert.service, deadline),
+        ),
+        "cloudwatch_metrics": (
+            ("cloudwatch_metrics", alert.cluster, alert.service),
+            lambda: cloudwatch.collect_metrics(alert.cluster, alert.service, deadline),
+        ),
+        "cloudwatch_logs": (
+            ("cloudwatch_logs", alert.service),
+            lambda: cloudwatch.collect_logs(alert.service, deadline),
+        ),
+        "grafana": (
+            ("grafana", alert.name),
+            lambda: grafana.collect(alert.name, deadline),
+        ),
+        "splunk": (
+            ("splunk", alert.service),
+            lambda: splunk.collect(alert.service, deadline),
+        ),
     }
 
     started = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=len(collectors)) as pool:
-        futures = {name: pool.submit(_safe_collect, name, fn) for name, fn in collectors.items()}
+        # partial rather than a lambda: a lambda closing over the comprehension
+        # variables would bind them late and hand every collector the last pair.
+        futures = {
+            name: pool.submit(cache.get, key, partial(_safe_collect, name, fn))
+            for name, (key, fn) in collectors.items()
+        }
         context = {name: future.result() for name, future in futures.items()}
 
     available = [name for name, payload in context.items() if payload.get("available")]
